@@ -87,7 +87,7 @@ function escolherArquivos(accept, multiple = true) {
 // ================= câmera =================
 // Abre a câmera em tela cheia. Cada aluno pode ter várias páginas.
 // onAluno(blobs) é chamado sempre que um aluno é concluído (para já enviar e corrigir).
-async function abrirCamera({ titulo = "Fotografar", umSo = false, onAluno }) {
+async function abrirCamera({ titulo = "Fotografar", umSo = false, onAluno, onAnexar, rotuloConcluir }) {
   let stream;
   try {
     stream = await navigator.mediaDevices.getUserMedia({ audio: false, video: { facingMode: { ideal: "environment" }, width: { ideal: 4096 }, height: { ideal: 3072 } } });
@@ -104,13 +104,13 @@ async function abrirCamera({ titulo = "Fotografar", umSo = false, onAluno }) {
   el.innerHTML = `
     <video playsinline autoplay muted></video>
     <div class="flash"></div>
-    <div class="topbar"><button class="ico" data-a="fechar">✕</button><div class="grow" id="camInfo"></div></div>
+    <div class="topbar"><button class="ico" data-a="fechar">✕</button><div class="grow" id="camInfo"></div>${onAnexar ? `<button class="side" data-a="anexar" style="background:rgba(255,255,255,.18);color:#fff;border:none">📎 Anexar arquivo</button>` : ""}</div>
     <div class="bottom">
       <div class="strip" id="camStrip"></div>
       <div class="ctrl">
         <button class="side" data-a="desfazer">↶ Apagar última</button>
         <button class="shutter" data-a="foto" aria-label="Tirar foto"></button>
-        <button class="side" data-a="proximo">${umSo ? "Concluir ✓" : "Próximo aluno ▸"}</button>
+        <button class="side" data-a="proximo">${umSo ? (rotuloConcluir || "Concluir ✓") : "Próximo aluno ▸"}</button>
       </div>
     </div>`;
   document.body.append(el);
@@ -138,6 +138,8 @@ async function abrirCamera({ titulo = "Fotografar", umSo = false, onAluno }) {
     else if (a === "proximo") {
       if (!paginas.length) { toast("Tire pelo menos uma foto."); return; }
       concluirAluno(); if (umSo) fechar(); else { info(); toast("Enviado. Pode fotografar o próximo aluno."); }
+    } else if (a === "anexar") {
+      fechar(); onAnexar();
     } else if (a === "fechar") {
       if (paginas.length && await confirmar(`Enviar as ${paginas.length} página(s) já tiradas antes de fechar?`, "Enviar")) concluirAluno();
       fechar();
@@ -165,7 +167,7 @@ async function novaCorrecao(prova, blobs) {
   try {
     const fotos = await enviarFotos(prova.id, id, blobs);
     put("correcoes", await q(sb.from("correcoes").insert({ id, prova_id: prova.id, fotos, status: "pendente" }).select().single()));
-    enfileirar(id);
+    if ((prova.gabarito || "").trim()) enfileirar(id);
   } catch (e) { falha(e); toast("Falha ao enviar uma prova. Verifique a internet e tente de novo."); }
   if (rotaAtual().startsWith("#/p/" + prova.id)) render();
 }
@@ -213,7 +215,7 @@ async function render(silencioso) {
   if (!silencioso) main.innerHTML = `<div class="empty">Carregando…</div>`;
   try {
     let html, bind;
-    if (!r[0]) [html, bind] = await telaDisciplinas();
+    if (!r[0]) [html, bind] = await telaInicio();
     else if (r[0] === "d") [html, bind] = await telaDisciplina(r[1], r[2] || "provas");
     else if (r[0] === "p") [html, bind] = await telaProva(r[1], r[2] || "corrigir");
     else if (r[0] === "c") [html, bind] = await telaCorrecao(r[1]);
@@ -257,6 +259,150 @@ function bindLogin() {
     } catch (e) { msg.innerHTML = `<div class="err">${esc(e.message)}</div>`; }
     const b = $("#lOk"); if (b) b.disabled = false;
   };
+}
+
+// ================= escolha em botões =================
+function escolher(titulo, opcoes, sub = "") {
+  return new Promise(res => {
+    const m = document.createElement("div"); m.className = "modal"; m.style.alignItems = "flex-end";
+    m.innerHTML = `<div class="box" style="max-height:85vh;overflow:auto"><h3 style="font-size:17px">${esc(titulo)}</h3>${sub ? `<p class="small muted" style="margin-top:-4px">${esc(sub)}</p>` : ""}
+      ${opcoes.map((o, i) => `<button class="big ${o.pri ? "pri" : ""}" data-i="${i}" style="margin-bottom:8px;text-align:left" dir="auto">${esc(o.t)}${o.s ? `<div class="small" style="font-weight:400;opacity:.75">${esc(o.s)}</div>` : ""}</button>`).join("")}
+      <button class="ghost big" data-i="-1">Cancelar</button></div>`;
+    m.onclick = e => { const b = e.target.closest("[data-i]"); if (!b) return; m.remove(); const i = +b.dataset.i; res(i < 0 ? null : opcoes[i].v); };
+    document.body.append(m);
+  });
+}
+function aviso(msg) { const m = document.createElement("div"); m.className = "modal"; m.innerHTML = `<div class="box"><div id="avTxt">${msg}</div></div>`; document.body.append(m); return { set: h => { $("#avTxt", m).innerHTML = h; }, fechar: () => m.remove() }; }
+
+async function transcreverFotos(prova, tipo, blobs) {
+  const paths = await enviarFotos(prova.id, tipo, blobs);
+  const { data, error } = await sb.functions.invoke("corrigir", { body: { acao: tipo === "modelo" ? "transcrever_modelo" : "transcrever_gabarito", fotos: paths } });
+  if (error) { let m = error.message; try { m = (await error.context.json()).erro || m; } catch { } throw new Error(m); }
+  const campo = tipo === "modelo" ? "modelo_fotos" : "gabarito_fotos";
+  try { await q(sb.from("provas").update({ [campo]: [...(prova[campo] || []), ...paths] }).eq("id", prova.id)); } catch { }
+  return data.texto;
+}
+async function corrigirPendentes(provaId) {
+  const ps = await q(sb.from("correcoes").select("id").eq("prova_id", provaId).in("status", ["pendente", "erro"]));
+  ps.forEach(c => enfileirar(c.id));
+  if (ps.length) toast(`Corrigindo ${ps.length} prova(s) que estavam esperando o gabarito.`);
+}
+// lê arquivos anexados: imagens (por arquivo) e textos (Word/TXT/PDF digital)
+async function lerAnexos(fs) {
+  const grupos = [], textos = [];
+  for (const f of fs) {
+    try {
+      if (/\.docx$/i.test(f.name)) { await carregarScript("https://cdn.jsdelivr.net/npm/mammoth@1.8.0/mammoth.browser.min.js"); textos.push((await window.mammoth.extractRawText({ arrayBuffer: await f.arrayBuffer() })).value.trim()); }
+      else if (/\.txt$/i.test(f.name)) textos.push((await f.text()).trim());
+      else if (/\.pdf$/i.test(f.name) || f.type === "application/pdf") { const imgs = await pdfParaImagens(f); grupos.push(imgs); const t = await pdfTexto(f).catch(() => ""); if (t) textos.push(t); }
+      else grupos.push(await arquivoParaImagens(f));
+    } catch (e) { falha(e); }
+  }
+  return { grupos, textos };
+}
+
+// Fluxo principal: foto/arquivo → o que é → disciplina → prova
+async function fluxoEntrada(entrada) {
+  const tipo = await escolher("O que é isso?", [
+    { v: "feita", t: "📝 Prova feita", s: "Prova respondida por um aluno — vai para a correção", pri: true },
+    { v: "gabarito", t: "✅ Gabarito", s: "As respostas certas (ou a prova preenchida por você)" },
+    { v: "modelo", t: "📄 Exemplo de prova", s: "A prova em branco, com as perguntas" },
+  ]);
+  if (!tipo) return;
+  const ds = await q(sb.from("disciplinas").select("*").order("nome").order("turma"));
+  if (!ds.length) { toast("Cadastre uma disciplina primeiro."); return; }
+  const discId = await escolher("De qual disciplina?", ds.map(d => ({ v: d.id, t: `${d.nome} — ${d.turma || ""}` })));
+  if (!discId) return;
+  const disc = ds.find(d => d.id === discId);
+  const provas = await q(sb.from("provas").select("*").eq("disciplina_id", discId).order("created_at", { ascending: false }));
+  const novaProva = async () => {
+    const titulo = await perguntar("Nome da prova", `Prova ${new Date().toLocaleDateString("pt-BR")}`); if (!titulo) return null;
+    return put("provas", await q(sb.from("provas").insert({ disciplina_id: discId, titulo }).select().single()));
+  };
+  const escolherProva = async (titulo) => {
+    if (!provas.length) return await novaProva();
+    const v = await escolher(titulo, [...provas.map(p => ({ v: p.id, t: p.titulo, s: `${dataBR(p.data)} · ${p.gabarito.trim() ? "com gabarito" : "sem gabarito"}` })), { v: "__nova", t: "+ Nova prova" }], `${disc.nome} — ${disc.turma || ""}`);
+    if (!v) return null; if (v === "__nova") return await novaProva(); return provas.find(p => p.id === v);
+  };
+
+  if (tipo === "feita") {
+    if (!entrada.grupos.length) { toast("Para corrigir preciso de foto ou PDF da prova."); return; }
+    let prova = provas.length === 1 ? provas[0] : await escolherProva("Qual prova é essa?");
+    if (!prova) return;
+    let lotes = entrada.grupos;
+    if (lotes.length > 1) {
+      const m = await escolher(`Você enviou ${lotes.length} arquivos.`, [{ v: "cada", t: "Cada arquivo é de um aluno diferente", pri: true }, { v: "um", t: "Todos são do mesmo aluno" }]);
+      if (!m) return; if (m === "um") lotes = [lotes.flat()];
+    }
+    const av = aviso(`Enviando ${lotes.length} prova(s)…`);
+    for (const l of lotes) await novaCorrecao(prova, l);
+    av.fechar();
+    const semGab = !prova.gabarito.trim();
+    const prox = await escolher(semGab ? "Prova guardada ✓" : "Enviada para correção ✓",
+      [{ v: "prox", t: "📷 Fotografar o próximo aluno", s: `${disc.nome} — ${disc.turma || ""} · ${prova.titulo}`, pri: true }, { v: "ver", t: "Ver as correções desta prova" }, { v: "fim", t: "Concluir" }],
+      semGab ? "Esta prova ainda não tem gabarito. Assim que você enviar o gabarito, eu corrijo todas." : "A IA identifica o nome do aluno sozinha.");
+    if (prox === "prox") abrirCamera({ titulo: `${disc.nome} — ${disc.turma || ""}`, onAluno: blobs => novaCorrecao(prova, blobs) });
+    else if (prox === "ver") ir(`#/p/${prova.id}/corrigir`);
+    else render(true);
+    return;
+  }
+
+  // gabarito ou modelo
+  const prova = await escolherProva(tipo === "gabarito" ? "Gabarito de qual prova?" : "Modelo de qual prova?");
+  if (!prova) return;
+  const campo = tipo === "gabarito" ? "gabarito" : "modelo";
+  let texto = entrada.textos.join("\n\n");
+  const av = aviso(tipo === "gabarito" ? "Lendo o gabarito… (até 1 minuto)" : "Lendo o modelo da prova… (até 1 minuto)");
+  try {
+    if (!texto && entrada.grupos.length) texto = await transcreverFotos(prova, tipo, entrada.grupos.flat());
+    if (!texto) throw new Error("Não consegui ler o conteúdo.");
+    let final = texto;
+    if ((prova[campo] || "").trim()) {
+      av.fechar();
+      const m = await escolher(`Esta prova já tem ${tipo === "gabarito" ? "gabarito" : "modelo"}.`, [{ v: "sub", t: "Substituir pelo novo", pri: true }, { v: "junta", t: "Juntar com o que já existe" }]);
+      if (!m) return; if (m === "junta") final = prova[campo].trim() + "\n\n" + texto;
+    } else av.fechar();
+    await q(sb.from("provas").update({ [campo]: final }).eq("id", prova.id));
+    if (tipo === "gabarito") await corrigirPendentes(prova.id);
+    toast(tipo === "gabarito" ? "Gabarito salvo. Confira o texto." : "Modelo salvo. Confira o texto.");
+    ir(`#/p/${prova.id}/gabarito`);
+  } catch (e) { av.fechar(); falha(e); }
+}
+async function capturar() {
+  abrirCamera({ titulo: "Nova foto", umSo: true, rotuloConcluir: "Pronto ✓", onAluno: blobs => fluxoEntrada({ grupos: [blobs], textos: [] }), onAnexar: anexar });
+}
+async function anexar() {
+  const fs = await escolherArquivos("image/*,application/pdf,.pdf,.docx,.txt"); if (!fs.length) return;
+  const av = aviso("Preparando arquivos…"); const e = await lerAnexos(fs); av.fechar();
+  if (!e.grupos.length && !e.textos.length) return;
+  fluxoEntrada(e);
+}
+
+// ================= início =================
+async function telaInicio() {
+  cabecalho("Corretor de Provas");
+  const ds = put("disciplinas", await q(sb.from("disciplinas").select("*").order("nome").order("turma")));
+  const html = `
+    <div class="card" style="text-align:center">
+      <button class="pri big" id="iFoto" style="font-size:19px;padding:22px">📷 Tirar foto</button>
+      <button class="big" id="iAnexo" style="margin-top:10px">📎 Anexar arquivo</button>
+      <p class="small muted" style="margin:10px 0 0">Prova feita, gabarito ou exemplo de prova — eu pergunto depois.</p>
+    </div>
+    <h3 style="margin:18px 2px 8px">Minhas disciplinas</h3>
+    <div class="card">${ds.length ? ds.map(d => `
+      <div class="item" data-go="#/d/${d.id}"><div class="grow"><div class="t" dir="auto">${esc(d.nome)}</div><div class="s">${esc(d.turma || "")}</div></div><span class="chev">›</span></div>`).join("")
+      : `<div class="empty">Nenhuma disciplina ainda.</div>`}
+      <button class="ghost" id="novaDisc" style="width:100%;margin-top:6px">+ Nova disciplina</button></div>`;
+  return [html, () => {
+    $$("[data-go]").forEach(el => el.onclick = () => ir(el.dataset.go));
+    $("#iFoto").onclick = capturar; $("#iAnexo").onclick = anexar;
+    $("#novaDisc").onclick = async () => {
+      const nome = await perguntar("Nome da disciplina (ex.: Rashi)"); if (!nome) return;
+      const turma = await perguntar("Turma (ex.: Shiur Alef)") ?? "";
+      try { const d = await q(sb.from("disciplinas").insert({ nome, turma }).select().single()); put("disciplinas", d); ir("#/d/" + d.id); } catch (e) { falha(e); }
+    };
+    if (!S.cameraInicialAberta) { S.cameraInicialAberta = true; capturar(); }
+  }];
 }
 
 // ================= disciplinas =================
@@ -392,6 +538,9 @@ function abaGabarito(p) {
       </div>
       <div id="gMsg"></div>
       <textarea id="gTxt" dir="auto" style="min-height:240px" placeholder="1) (10 pontos) …&#10;2) (15 pontos) …&#10;3) (5 pontos) …">${esc(p.gabarito)}</textarea>
+      <h3 style="margin-top:16px">Exemplo da prova (modelo em branco) <span class="small muted" style="font-weight:400">— opcional, ajuda a IA a entender as perguntas</span></h3>
+      <div class="row" style="margin-bottom:8px"><button class="grow" id="mFoto">📷 Fotografar modelo</button></div>
+      <textarea id="mTxt" dir="auto" style="min-height:120px" placeholder="Enunciados das questões…">${esc(p.modelo || "")}</textarea>
       <label class="f" style="margin-top:10px">Orientações de correção (opcional)
         <textarea id="gInst" rows="2" placeholder="Ex.: aceitar resposta em hebraico ou português; não descontar ortografia.">${esc(p.instrucoes)}</textarea></label>
     </div>
@@ -409,6 +558,11 @@ function abaGabarito(p) {
   };
   return [html, () => {
     $("#gFoto").onclick = () => abrirCamera({ titulo: "Gabarito", umSo: true, onAluno: transcrever });
+    $("#mFoto").onclick = () => abrirCamera({ titulo: "Modelo da prova", umSo: true, onAluno: async blobs => {
+      const msg = $("#gMsg"); msg.innerHTML = `<div class="info">Lendo o modelo da prova…</div>`;
+      try { const t = await transcreverFotos(p, "modelo", blobs); const m = $("#mTxt"); m.value = (m.value.trim() ? m.value.trim() + "\n\n" : "") + t; msg.innerHTML = `<div class="info">Modelo transcrito. Confira e toque em Salvar.</div>`; }
+      catch (e) { msg.innerHTML = `<div class="err">${esc(e.message)}</div>`; }
+    } });
     $("#gArq").onclick = async () => {
       const fs = await escolherArquivos("image/*,application/pdf,.pdf,.docx,.txt"); if (!fs.length) return;
       const imgs = [];
@@ -423,8 +577,8 @@ function abaGabarito(p) {
       if (imgs.length) transcrever(imgs); else $("#gMsg").innerHTML = `<div class="info">Texto colocado no gabarito. Confira e toque em Salvar.</div>`;
     };
     $("#gSalvar").onclick = async () => {
-      const upd = { titulo: $("#gTit").value.trim() || p.titulo, data: $("#gData").value || null, valor_padrao: num($("#gVal").value) || 1, gabarito: $("#gTxt").value, instrucoes: $("#gInst").value };
-      try { await q(sb.from("provas").update(upd).eq("id", p.id)); toast("Gabarito salvo"); ir(`#/p/${p.id}/corrigir`); } catch (e) { falha(e); }
+      const upd = { titulo: $("#gTit").value.trim() || p.titulo, data: $("#gData").value || null, valor_padrao: num($("#gVal").value) || 1, gabarito: $("#gTxt").value, modelo: $("#mTxt").value, instrucoes: $("#gInst").value };
+      try { await q(sb.from("provas").update(upd).eq("id", p.id)); toast("Gabarito salvo"); if (upd.gabarito.trim()) await corrigirPendentes(p.id); ir(`#/p/${p.id}/corrigir`); } catch (e) { falha(e); }
     };
     $("#exclProva").onclick = async () => { if (await confirmar(`Excluir a prova "${p.titulo}" e todas as correções dela?`, "Excluir")) { try { await q(sb.from("provas").delete().eq("id", p.id)); ir(`#/d/${p.disciplina_id}`); } catch (e) { falha(e); } } };
   }];
