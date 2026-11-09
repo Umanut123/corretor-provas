@@ -1,0 +1,11 @@
+-- Referência da estrutura do banco (projeto Supabase "Corretor de Provas", ref ukuagyzpxklygbxjkrwt)
+-- disciplinas(id, owner, nome, turma, created_at)
+-- alunos(id, owner, disciplina_id -> disciplinas, nome, created_at)
+-- provas(id, owner, disciplina_id -> disciplinas, titulo, data, gabarito, valor_padrao, instrucoes, analise,
+--        modelo, modelo_fotos[], gabarito_fotos[], created_at)
+-- correcoes(id, owner, prova_id -> provas, aluno_id -> alunos (null se não identificado), nome_lido, nome_incerto,
+--           status [pendente|corrigindo|corrigido|erro], questoes jsonb [{q, valor, pct, nota, resposta, legivel, obs}],
+--           nota, nota_max, comentario, revisado, fotos[], erro, created_at, updated_at)
+-- usuarios_autorizados(email)  -- quem pode usar a IA (lido só pelo servidor)
+-- RLS: cada tabela só deixa o dono (owner = auth.uid()) ler/escrever.
+-- Storage: bucket privado "provas", pasta = id do usuário: <uid>/<prova_id>/<correcao_id|gabarito|modelo>/<arquivo>.jpg
