@@ -42,6 +42,52 @@ function baixarArquivo(nome, conteudo, tipo = "text/csv;charset=utf-8") {
 const slug = s => (s || "arquivo").normalize("NFD").replace(/[̀-ͯ]/g, "").replace(/[^a-zA-Z0-9]+/g, "-").replace(/^-|-$/g, "").toLowerCase();
 const csvLinha = arr => arr.map(v => `"${String(v ?? "").replace(/"/g, '""')}"`).join(";");
 
+// ================= Excel (.xlsx) =================
+let xlsxPromise = null;
+function xlsxLib() {
+  if (!xlsxPromise) xlsxPromise = carregarScript("https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js")
+    .catch(() => carregarScript("https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"))
+    .then(() => window.XLSX).catch(e => { xlsxPromise = null; throw e; });
+  return xlsxPromise;
+}
+function nomeAba(s, usados) {
+  const base = String(s || "Planilha").replace(/[\[\]*?/\\:]/g, " ").replace(/\s+/g, " ").trim().slice(0, 31) || "Planilha";
+  let n = base, i = 2;
+  while (usados.has(n.toLowerCase())) { const suf = ` (${i++})`; n = base.slice(0, 31 - suf.length) + suf; }
+  usados.add(n.toLowerCase()); return n;
+}
+// abas: [{ nome, linhas: [[cabeçalho...], [valores...], ...] }]
+async function baixarExcel(nomeArq, abas) {
+  const av = aviso("Gerando o arquivo Excel…");
+  try {
+    const X = await xlsxLib(); const wb = X.utils.book_new(); const usados = new Set();
+    for (const a of abas) {
+      const ws = X.utils.aoa_to_sheet(a.linhas);
+      ws["!cols"] = (a.linhas[0] || []).map((_, j) => ({ wch: Math.min(60, Math.max(8, ...a.linhas.map(l => String(l[j] ?? "").length + 2))) }));
+      X.utils.book_append_sheet(wb, ws, nomeAba(a.nome, usados));
+    }
+    X.writeFile(wb, nomeArq);
+    toast("Arquivo Excel baixado");
+  } catch (e) { falha(e); toast("Não consegui gerar o Excel. Verifique a internet e tente de novo."); }
+  av.fechar();
+}
+const n2 = v => (v == null || v === "" || isNaN(v)) ? "" : r2(Number(v));
+// linhas de uma prova: um aluno por linha, com a nota de cada questão
+function linhasProva(cs, am) {
+  const corr = cs.filter(c => c.status === "corrigido").sort((a, b) => nomeCorr(a, am).localeCompare(nomeCorr(b, am), "pt-BR"));
+  const labels = []; corr.forEach(c => (c.questoes || []).forEach(x => { if (!labels.includes(x.q)) labels.push(x.q); }));
+  const linhas = [["Aluno", ...labels.map(l => `Q${l}`), "Nota", "Máximo", "%", "Revisado", "Comentário"]];
+  corr.forEach(c => linhas.push([nomeCorr(c, am), ...labels.map(l => { const x = (c.questoes || []).find(y => y.q === l); return x ? n2(x.nota) : ""; }),
+    n2(c.nota), n2(c.nota_max), c.nota_max ? Math.round(c.nota / c.nota_max * 100) : "", c.revisado ? "sim" : "não", c.comentario || ""]));
+  if (corr.length) {
+    const media = arr => arr.length ? r2(arr.reduce((s, v) => s + v, 0) / arr.length) : "";
+    linhas.push([]);
+    linhas.push(["Média da turma", ...labels.map(l => media(corr.map(c => (c.questoes || []).find(y => y.q === l)).filter(Boolean).map(x => Number(x.nota)))),
+      media(corr.map(c => Number(c.nota))), "", Math.round(media(corr.map(c => c.nota_max ? c.nota / c.nota_max * 100 : 0)))]);
+  }
+  return linhas;
+}
+
 // ================= imagens =================
 async function reduzir(src, MAX = 2400) {
   const w = src.width || src.videoWidth, h = src.height || src.videoHeight, k = Math.min(1, MAX / Math.max(w, h));
@@ -462,7 +508,7 @@ async function telaDisciplina(id, aba) {
     const [as, ps, cs] = await Promise.all([
       q(sb.from("alunos").select("*").eq("disciplina_id", id).order("nome")),
       q(sb.from("provas").select("id,titulo,data").eq("disciplina_id", id).order("data")),
-      q(sb.from("correcoes").select("id,prova_id,aluno_id,nota,nota_max,status,provas!inner(disciplina_id)").eq("provas.disciplina_id", id).eq("status", "corrigido")),
+      q(sb.from("correcoes").select("id,prova_id,aluno_id,nome_lido,nota,nota_max,status,questoes,revisado,comentario,provas!inner(disciplina_id)").eq("provas.disciplina_id", id).eq("status", "corrigido")),
     ]);
     const cel = (a, p) => cs.find(c => c.aluno_id === a.id && c.prova_id === p.id);
     const linhas = as.map(a => { const v = ps.map(p => cel(a, p)); const soma = v.reduce((s, c) => s + (c ? Number(c.nota) : 0), 0), max = v.reduce((s, c) => s + (c ? Number(c.nota_max) : 0), 0); return { a, v, soma, max }; });
@@ -471,9 +517,17 @@ async function telaDisciplina(id, aba) {
         <thead><tr><th>Aluno</th>${ps.map(p => `<th class="num" dir="auto">${esc(p.titulo)}</th>`).join("")}<th class="num">Total</th></tr></thead>
         <tbody>${linhas.map(({ a, v, soma, max }) => `<tr data-go="#/a/${a.id}"><td dir="auto">${esc(a.nome)}</td>${v.map(c => `<td class="num">${c ? `${fmt(c.nota)}<span class="small muted">/${fmt(c.nota_max)}</span>` : "–"}</td>`).join("")}<td class="num"><b>${max ? fmt(soma) : "–"}</b>${max ? `<span class="small muted">/${fmt(max)}</span>` : ""}</td></tr>`).join("")}</tbody>
       </table></div>
-      <button id="expBol">Baixar boletim (planilha)</button>`;
+      <button class="pri big" id="expBol">📊 Baixar Excel com as notas</button>
+      <p class="small muted" style="margin:6px 2px 0">O arquivo tem uma aba com todos os alunos e provas, e uma aba para cada prova com a nota de cada questão.</p>`;
     bind = () => {
-      const b = $("#expBol"); if (b) b.onclick = () => baixarArquivo(`boletim-${slug(d.nome)}.csv`, "﻿" + [csvLinha(["Aluno", ...ps.map(p => p.titulo), "Total", "Máximo"]), ...linhas.map(({ a, v, soma, max }) => csvLinha([a.nome, ...v.map(c => c ? fmt(c.nota) : ""), fmt(soma), fmt(max)]))].join("\r\n"));
+      const b = $("#expBol"); if (b) b.onclick = () => {
+        const am = Object.fromEntries(as.map(a => [a.id, a]));
+        const boletim = [["Aluno", ...ps.map(p => p.titulo + (p.data ? ` (${dataBR(p.data)})` : "")), "Total", "Máximo", "%"],
+          ...linhas.map(({ a, v, soma, max }) => [a.nome, ...v.map(c => c ? n2(c.nota) : ""), max ? n2(soma) : "", max ? n2(max) : "", max ? Math.round(soma / max * 100) : ""])];
+        const abas = [{ nome: "Boletim", linhas: boletim }];
+        ps.forEach(p => { const cp = cs.filter(c => c.prova_id === p.id); if (cp.length) abas.push({ nome: p.titulo, linhas: linhasProva(cp, am) }); });
+        baixarExcel(`notas-${slug(d.nome)}-${slug(d.turma || "")}.xlsx`.replace("-.xlsx", ".xlsx"), abas);
+      };
     };
   }
   return [tabs + html, () => { $$("[data-go]").forEach(el => el.onclick = () => ir(el.dataset.go)); bind(); }];
@@ -649,7 +703,7 @@ function abaResultados(p, cs, am) {
       <thead><tr><th>Aluno</th>${labels.map(l => `<th class="num">Q${esc(l)}</th>`).join("")}<th class="num">Nota</th></tr></thead>
       <tbody>${ord.map(c => `<tr data-go="#/c/${c.id}"><td dir="auto">${esc(nomeCorr(c, am))}${c.revisado ? "" : " <span class='pill warn'>revisar</span>"}</td>${labels.map(l => { const x = c.questoes.find(y => y.q === l); return `<td class="num">${x ? fmt(x.nota) : "–"}</td>`; }).join("")}<td class="num"><b>${fmt(c.nota)}</b><span class="small muted">/${fmt(c.nota_max)}</span></td></tr>`).join("")}</tbody>
     </table></div>
-    <div class="row" style="margin-bottom:12px"><button class="grow" id="rCsv">Baixar planilha</button><button class="grow" id="rDev">Baixar devolutivas</button></div>
+    <div class="row" style="margin-bottom:12px"><button class="grow pri" id="rCsv">📊 Baixar Excel</button><button class="grow" id="rDev">Baixar devolutivas</button></div>
     <div class="card"><h3>Por questão (da mais difícil)</h3>
       ${porQ.map(x => `<div style="margin:10px 0"><div class="row"><b class="grow">Questão ${esc(x.l)}</b><span class="small">média ${fmt(x.media)} de ${fmt(x.valor)} · ${fmt(x.pct, 0)}%</span></div>
         <div class="bar ${x.pct < 50 ? "lo" : x.pct < 70 ? "mid" : ""}"><i style="width:${x.pct}%"></i></div></div>`).join("")}</div>
@@ -657,8 +711,7 @@ function abaResultados(p, cs, am) {
       <div id="rAnTxt" style="white-space:pre-wrap;margin-top:10px">${p.analise ? esc(p.analise) : `<span class="muted small">Pontos fortes, dificuldades e sugestões para a próxima aula.</span>`}</div></div>`;
   return [html, () => {
     $$("[data-go]").forEach(el => el.onclick = () => ir(el.dataset.go));
-    $("#rCsv").onclick = () => baixarArquivo(`${slug(p.titulo)}-notas.csv`, "﻿" + [csvLinha(["Aluno", ...labels.map(l => `Q${l}`), "Nota", "Máximo", "%", "Revisado", "Comentário"]),
-      ...ord.map(c => csvLinha([nomeCorr(c, am), ...labels.map(l => { const x = c.questoes.find(y => y.q === l); return x ? fmt(x.nota) : ""; }), fmt(c.nota), fmt(c.nota_max), fmt(c.nota / c.nota_max * 100, 0), c.revisado ? "sim" : "não", c.comentario]))].join("\r\n"));
+    $("#rCsv").onclick = () => baixarExcel(`${slug(p.titulo)}-notas.xlsx`, [{ nome: p.titulo, linhas: linhasProva(cs, am) }]);
     $("#rDev").onclick = () => baixarArquivo(`${slug(p.titulo)}-devolutivas.txt`, ord.map(c => devolutiva(c, am)).join("\n\n------------------------------\n\n"), "text/plain;charset=utf-8");
     $("#rAn").onclick = async () => {
       const b = $("#rAn"); b.disabled = true; $("#rAnTxt").textContent = "Analisando…";
