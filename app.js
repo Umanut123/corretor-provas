@@ -95,6 +95,32 @@ async function reduzir(src, MAX = 2400) {
   const ctx = c.getContext("2d"); ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, c.width, c.height); ctx.drawImage(src, 0, 0, c.width, c.height);
   return await new Promise(r => c.toBlob(r, "image/jpeg", 0.9));
 }
+// Mede a nitidez da foto (variância do Laplaciano numa versão reduzida, em tons de cinza).
+// Foto de texto bem focada dá valor alto; foto tremida/desfocada dá valor baixo.
+const NITIDEZ_MIN = 60;
+async function nitidez(blob) {
+  try {
+    const bmp = await createImageBitmap(blob), k = Math.min(1, 1000 / Math.max(bmp.width, bmp.height));
+    const w = Math.round(bmp.width * k), h = Math.round(bmp.height * k);
+    const c = document.createElement("canvas"); c.width = w; c.height = h;
+    const ctx = c.getContext("2d", { willReadFrequently: true }); ctx.drawImage(bmp, 0, 0, w, h);
+    const d = ctx.getImageData(0, 0, w, h).data, g = new Float32Array(w * h);
+    for (let i = 0; i < w * h; i++) g[i] = 0.299 * d[i * 4] + 0.587 * d[i * 4 + 1] + 0.114 * d[i * 4 + 2];
+    let n = 0, soma = 0, soma2 = 0;
+    for (let y = 1; y < h - 1; y += 1) for (let x = 1; x < w - 1; x += 1) {
+      const i = y * w + x, v = 4 * g[i] - g[i - 1] - g[i + 1] - g[i - w] - g[i + w];
+      soma += v; soma2 += v * v; n++;
+    }
+    const m = soma / n; return soma2 / n - m * m;
+  } catch { return 999; }
+}
+// Pergunta se quer tirar de novo quando a foto parece borrada. Devolve true se é para FICAR com a foto.
+async function aceitarFoto(blob, pagina = "") {
+  const v = await nitidez(blob);
+  if (v >= NITIDEZ_MIN) return true;
+  return !(await confirmar(`A foto${pagina ? " da " + pagina : ""} parece borrada ou tremida, e a IA pode não conseguir ler as respostas. Quer tirar de novo?`, "Tirar de novo"));
+}
+
 let pdfjsPromise = null;
 function carregarScript(src) { return new Promise((ok, no) => { const s = document.createElement("script"); s.src = src; s.onload = ok; s.onerror = no; document.head.append(s); }); }
 async function pdfjs() {
@@ -141,16 +167,28 @@ async function abrirCamera({ titulo = "Fotografar", umSo = false, onAluno, onAne
     console.warn(e);
     toast("Não consegui abrir a câmera aqui; usando a câmera do celular.");
     const fs = await new Promise(res => { const i = document.createElement("input"); i.type = "file"; i.accept = "image/*"; i.capture = "environment"; i.onchange = () => res([...i.files]); i.click(); });
-    if (fs.length) onAluno(await Promise.all(fs.map(async f => reduzir(await createImageBitmap(f)))));
+    if (fs.length) { const bs = await Promise.all(fs.map(async f => reduzir(await createImageBitmap(f)))); await aceitarFoto(bs[0]) ? onAluno(bs) : toast("Toque de novo para tirar outra foto."); }
     return;
   }
   const track = stream.getVideoTracks()[0];
   let imageCapture = null; try { if ("ImageCapture" in window) imageCapture = new ImageCapture(track); } catch { }
+  // Foco automático contínuo (quando o celular permite).
+  const caps = (() => { try { return track.getCapabilities?.() || {}; } catch { return {}; } })();
+  const focar = async (x, y) => {
+    try {
+      const modos = caps.focusMode || [];
+      if (x != null && modos.includes("single-shot")) {
+        await track.applyConstraints({ advanced: [{ pointsOfInterest: [{ x, y }], focusMode: "single-shot" }] });
+        setTimeout(() => { if (modos.includes("continuous")) track.applyConstraints({ advanced: [{ focusMode: "continuous" }] }).catch(() => { }); }, 1500);
+      } else if (modos.includes("continuous")) await track.applyConstraints({ advanced: [{ focusMode: "continuous" }] });
+    } catch { }
+  };
+  focar();
   const el = document.createElement("div"); el.className = "cam";
   el.innerHTML = `
     <video playsinline autoplay muted></video>
     <div class="flash"></div>
-    <div class="topbar"><button class="ico" data-a="fechar">✕</button><div class="grow" id="camInfo"></div>${onAnexar ? `<button class="side" data-a="anexar" style="background:rgba(255,255,255,.18);color:#fff;border:none">📎 Anexar arquivo</button>` : ""}</div>
+    <div class="topbar"><button class="ico" data-a="fechar">✕</button><div class="grow" id="camInfo"></div><button class="side" data-a="nativa" style="background:rgba(255,255,255,.18);color:#fff;border:none">📷 Câmera do celular</button>${onAnexar ? `<button class="side" data-a="anexar" style="background:rgba(255,255,255,.18);color:#fff;border:none">📎 Anexar arquivo</button>` : ""}</div>
     <div class="bottom">
       <div class="strip" id="camStrip"></div>
       <div class="ctrl">
@@ -161,10 +199,15 @@ async function abrirCamera({ titulo = "Fotografar", umSo = false, onAluno, onAne
     </div>`;
   document.body.append(el);
   const video = $("video", el); video.srcObject = stream;
+  // Toque na imagem para focar naquele ponto.
+  video.addEventListener("click", e => {
+    const r = video.getBoundingClientRect(); focar((e.clientX - r.left) / r.width, (e.clientY - r.top) / r.height);
+    const f = document.createElement("div"); f.className = "foco"; f.style.left = e.clientX + "px"; f.style.top = e.clientY + "px"; el.append(f); setTimeout(() => f.remove(), 900);
+  });
   let paginas = [], alunosFeitos = 0, ocupado = false;
   const info = () => {
     $("#camInfo", el).innerHTML = `<b>${esc(titulo)}</b><br><span class="small">${umSo ? "" : `Aluno ${alunosFeitos + 1} · `}${paginas.length} página(s)${alunosFeitos ? ` · ${alunosFeitos} aluno(s) enviados` : ""}</span>`;
-    $("#camStrip", el).innerHTML = paginas.map(p => `<img src="${p.url}">`).join("") || `<span class="small" style="opacity:.7;align-self:center">Enquadre a página inteira, com boa luz, e toque no botão.</span>`;
+    $("#camStrip", el).innerHTML = paginas.map(p => `<img src="${p.url}">`).join("") || `<span class="small" style="opacity:.7;align-self:center">Enquadre a página inteira, com boa luz. Toque na imagem para focar e depois no botão.</span>`;
   };
   info();
   const concluirAluno = () => { if (!paginas.length) return false; const blobs = paginas.map(p => p.blob); paginas.forEach(p => URL.revokeObjectURL(p.url)); paginas = []; alunosFeitos++; onAluno(blobs); return true; };
@@ -177,7 +220,16 @@ async function abrirCamera({ titulo = "Fotografar", umSo = false, onAluno, onAne
         let blob;
         if (imageCapture) { try { blob = await reduzir(await createImageBitmap(await imageCapture.takePhoto())); } catch { blob = null; } }
         if (!blob) blob = await reduzir(video);
-        paginas.push({ blob, url: URL.createObjectURL(blob) }); navigator.vibrate?.(30);
+        navigator.vibrate?.(30);
+        if (await aceitarFoto(blob)) paginas.push({ blob, url: URL.createObjectURL(blob) });
+      } catch (err) { falha(err); }
+      ocupado = false; info();
+    } else if (a === "nativa") {
+      // Câmera normal do celular (foco e tratamento de imagem melhores). As fotos entram como páginas deste aluno.
+      ocupado = true;
+      try {
+        const fs = await new Promise(res => { const i = document.createElement("input"); i.type = "file"; i.accept = "image/*"; i.capture = "environment"; i.onchange = () => res([...i.files]); i.click(); });
+        for (const f of fs) { const blob = await reduzir(await createImageBitmap(f)); if (await aceitarFoto(blob)) paginas.push({ blob, url: URL.createObjectURL(blob) }); }
       } catch (err) { falha(err); }
       ocupado = false; info();
     } else if (a === "desfazer") { const p = paginas.pop(); if (p) URL.revokeObjectURL(p.url); info(); }
