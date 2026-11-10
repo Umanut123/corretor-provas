@@ -77,12 +77,12 @@ function linhasProva(cs, am) {
   const corr = cs.filter(c => c.status === "corrigido").sort((a, b) => nomeCorr(a, am).localeCompare(nomeCorr(b, am), "pt-BR"));
   const labels = []; corr.forEach(c => (c.questoes || []).forEach(x => { if (!labels.includes(x.q)) labels.push(x.q); }));
   const linhas = [["Aluno", ...labels.map(l => `Q${l}`), "Nota", "Máximo", "%", "Revisado", "Comentário"]];
-  corr.forEach(c => linhas.push([nomeCorr(c, am), ...labels.map(l => { const x = (c.questoes || []).find(y => y.q === l); return x ? n2(x.nota) : ""; }),
+  corr.forEach(c => linhas.push([nomeCorr(c, am), ...labels.map(l => { const x = (c.questoes || []).find(y => y.q === l); return contaQ(x) ? n2(x.nota) : ""; }),
     n2(c.nota), n2(c.nota_max), c.nota_max ? Math.round(c.nota / c.nota_max * 100) : "", c.revisado ? "sim" : "não", c.comentario || ""]));
   if (corr.length) {
     const media = arr => arr.length ? r2(arr.reduce((s, v) => s + v, 0) / arr.length) : "";
     linhas.push([]);
-    linhas.push(["Média da turma", ...labels.map(l => media(corr.map(c => (c.questoes || []).find(y => y.q === l)).filter(Boolean).map(x => Number(x.nota)))),
+    linhas.push(["Média da turma", ...labels.map(l => media(corr.map(c => (c.questoes || []).find(y => y.q === l)).filter(contaQ).map(x => Number(x.nota)))),
       media(corr.map(c => Number(c.nota))), "", Math.round(media(corr.map(c => c.nota_max ? c.nota / c.nota_max * 100 : 0)))]);
   }
   return linhas;
@@ -197,6 +197,7 @@ async function abrirCamera({ titulo = "Fotografar", umSo = false, onAluno, onAne
 const S = { user: null, cache: {}, fila: [], filaAtiva: 0, rodandoIds: new Set() };
 const C = (tab, id) => S.cache[tab + ":" + id];
 const put = (tab, rows) => { (Array.isArray(rows) ? rows : [rows]).forEach(r => r && (S.cache[tab + ":" + r.id] = r)); return rows; };
+const contaQ = x => x && x.conta !== false;   // questão entra na nota (quando o aluno escolhe N de M, as outras não contam)
 const nomeCorr = (c, alunosMap) => (c.aluno_id && alunosMap?.[c.aluno_id]?.nome) || c.nome_lido || "(nome não identificado)";
 
 async function enviarFotos(provaId, correcaoId, blobs) {
@@ -213,9 +214,18 @@ async function novaCorrecao(prova, blobs) {
   try {
     const fotos = await enviarFotos(prova.id, id, blobs);
     put("correcoes", await q(sb.from("correcoes").insert({ id, prova_id: prova.id, fotos, status: "pendente" }).select().single()));
+    lerNome(id);
     if ((prova.gabarito || "").trim()) enfileirar(id);
   } catch (e) { falha(e); toast("Falha ao enviar uma prova. Verifique a internet e tente de novo."); }
   if (rotaAtual().startsWith("#/p/" + prova.id)) render();
+}
+// Lê só o nome do aluno logo após o envio (rápido), para o nome aparecer antes de a correção terminar.
+async function lerNome(id) {
+  try {
+    const { data } = await sb.functions.invoke("corrigir", { body: { acao: "ler_nome", correcao_id: id } });
+    const atual = C("correcoes", id);
+    if (data?.correcao && atual && atual.status !== "corrigido") { put("correcoes", { ...atual, ...data.correcao, status: atual.status }); redesenharSe(id); }
+  } catch (e) { console.warn("ler nome", e); }
 }
 function enfileirar(id) { if (!S.fila.includes(id) && !S.rodandoIds.has(id)) S.fila.push(id); processarFila(); }
 async function processarFila() {
@@ -596,7 +606,7 @@ function abaGabarito(p) {
       <div class="row" style="margin-bottom:8px"><button class="grow" id="mFoto">📷 Fotografar modelo</button></div>
       <textarea id="mTxt" dir="auto" style="min-height:120px" placeholder="Enunciados das questões…">${esc(p.modelo || "")}</textarea>
       <label class="f" style="margin-top:10px">Orientações de correção (opcional)
-        <textarea id="gInst" rows="2" placeholder="Ex.: aceitar resposta em hebraico ou português; não descontar ortografia.">${esc(p.instrucoes)}</textarea></label>
+        <textarea id="gInst" rows="2" placeholder="Ex.: o aluno escolhe 10 de 15 questões; aceitar resposta em hebraico ou português; não descontar ortografia.">${esc(p.instrucoes)}</textarea></label>
     </div>
     <button class="ghost danger" id="exclProva" style="width:100%">Excluir prova</button>
     <button class="pri big fab" id="gSalvar">Salvar gabarito</button>`;
@@ -688,7 +698,7 @@ function abaResultados(p, cs, am) {
   const media = corr.reduce((s, c) => s + Number(c.nota), 0) / corr.length;
   const maxv = Math.max(...corr.map(c => Number(c.nota_max)));
   const labels = []; corr.forEach(c => c.questoes.forEach(x => { if (!labels.includes(x.q)) labels.push(x.q); }));
-  const porQ = labels.map(l => { const xs = corr.map(c => c.questoes.find(x => x.q === l)).filter(Boolean); return { l, valor: xs[0]?.valor, media: xs.reduce((s, x) => s + x.nota, 0) / xs.length, pct: xs.reduce((s, x) => s + x.pct, 0) / xs.length }; }).sort((a, b) => a.pct - b.pct);
+  const porQ = labels.map(l => { const xs = corr.map(c => c.questoes.find(x => x.q === l)).filter(contaQ); return { l, valor: xs[0]?.valor, media: xs.reduce((s, x) => s + x.nota, 0) / xs.length, pct: xs.reduce((s, x) => s + x.pct, 0) / xs.length, n: xs.length }; }).filter(x => x.n).sort((a, b) => a.pct - b.pct);
   const ord = [...corr].sort((a, b) => nomeCorr(a, am).localeCompare(nomeCorr(b, am), "pt-BR"));
   const naoRev = corr.filter(c => !c.revisado).length;
   const html = `
@@ -701,11 +711,11 @@ function abaResultados(p, cs, am) {
     </div>
     <div class="card scroll"><table>
       <thead><tr><th>Aluno</th>${labels.map(l => `<th class="num">Q${esc(l)}</th>`).join("")}<th class="num">Nota</th></tr></thead>
-      <tbody>${ord.map(c => `<tr data-go="#/c/${c.id}"><td dir="auto">${esc(nomeCorr(c, am))}${c.revisado ? "" : " <span class='pill warn'>revisar</span>"}</td>${labels.map(l => { const x = c.questoes.find(y => y.q === l); return `<td class="num">${x ? fmt(x.nota) : "–"}</td>`; }).join("")}<td class="num"><b>${fmt(c.nota)}</b><span class="small muted">/${fmt(c.nota_max)}</span></td></tr>`).join("")}</tbody>
+      <tbody>${ord.map(c => `<tr data-go="#/c/${c.id}"><td dir="auto">${esc(nomeCorr(c, am))}${c.revisado ? "" : " <span class='pill warn'>revisar</span>"}</td>${labels.map(l => { const x = c.questoes.find(y => y.q === l); return `<td class="num">${contaQ(x) ? fmt(x.nota) : "–"}</td>`; }).join("")}<td class="num"><b>${fmt(c.nota)}</b><span class="small muted">/${fmt(c.nota_max)}</span></td></tr>`).join("")}</tbody>
     </table></div>
     <div class="row" style="margin-bottom:12px"><button class="grow pri" id="rCsv">📊 Baixar Excel</button><button class="grow" id="rDev">Baixar devolutivas</button></div>
     <div class="card"><h3>Por questão (da mais difícil)</h3>
-      ${porQ.map(x => `<div style="margin:10px 0"><div class="row"><b class="grow">Questão ${esc(x.l)}</b><span class="small">média ${fmt(x.media)} de ${fmt(x.valor)} · ${fmt(x.pct, 0)}%</span></div>
+      ${porQ.map(x => `<div style="margin:10px 0"><div class="row"><b class="grow">Questão ${esc(x.l)}</b><span class="small">${x.n < corr.length ? `${x.n} aluno(s) · ` : ""}média ${fmt(x.media)} de ${fmt(x.valor)} · ${fmt(x.pct, 0)}%</span></div>
         <div class="bar ${x.pct < 50 ? "lo" : x.pct < 70 ? "mid" : ""}"><i style="width:${x.pct}%"></i></div></div>`).join("")}</div>
     <div class="card"><div class="row"><h3 class="grow" style="margin:0">Análise da turma</h3><button id="rAn">${p.analise ? "Gerar de novo" : "Gerar com IA"}</button></div>
       <div id="rAnTxt" style="white-space:pre-wrap;margin-top:10px">${p.analise ? esc(p.analise) : `<span class="muted small">Pontos fortes, dificuldades e sugestões para a próxima aula.</span>`}</div></div>`;
@@ -722,7 +732,8 @@ function abaResultados(p, cs, am) {
   }];
 }
 function devolutiva(c, am) {
-  return `${nomeCorr(c, am)} — ${fmt(c.nota)} de ${fmt(c.nota_max)}\n\n${c.comentario || ""}\n\n` + c.questoes.map(x => `• Questão ${x.q}: ${fmt(x.nota)} de ${fmt(x.valor)}${x.obs ? ` — ${x.obs}` : ""}`).join("\n");
+  return `${nomeCorr(c, am)} — ${fmt(c.nota)} de ${fmt(c.nota_max)}\n\n${c.comentario || ""}\n\n` + (c.escolher ? `(Você devia escolher ${c.escolher} questões; contaram as ${c.escolher} melhores.)\n\n` : "") +
+    c.questoes.filter(contaQ).map(x => `• Questão ${x.q}: ${fmt(x.nota)} de ${fmt(x.valor)}${x.obs ? ` — ${x.obs}` : ""}`).join("\n");
 }
 
 // ================= correção (detalhe) =================
@@ -753,11 +764,12 @@ async function telaCorrecao(id) {
     ${c.status === "corrigido" ? `
     <div class="card">
       <div class="row" style="margin-bottom:4px"><h3 class="grow" style="margin:0">Nota: ${fmt(c.nota)} de ${fmt(c.nota_max)}</h3><span class="pill ${pctClass(pctT)}">${fmt(pctT, 0)}%</span></div>
-      ${c.questoes.map((x, i) => `<div class="q">
-        <div class="row"><b class="grow">Questão ${esc(x.q)} <span class="small muted">· vale ${fmt(x.valor)}</span></b>
+      ${c.escolher ? `<div class="info small">O aluno escolhe <b>${c.escolher}</b> de ${c.questoes.length} questões: contam as ${c.escolher} respondidas com maior nota. Toque em “Contar / Não contar” para trocar.</div>` : ""}
+      ${c.questoes.map((x, i) => `<div class="q" ${contaQ(x) ? "" : `style="opacity:.55"`}>
+        <div class="row"><b class="grow">Questão ${esc(x.q)} <span class="small muted">· vale ${fmt(x.valor)}</span>${contaQ(x) ? "" : ` <span class="pill">não conta</span>`}</b>
           <input class="notaIn" inputmode="decimal" data-n="${i}" value="${esc(fmt(x.nota))}"><span class="small muted">/ ${fmt(x.valor)}</span></div>
         <div class="ans" dir="auto">${esc(x.resposta || "(em branco)")}</div>
-        <div class="row small"><span class="pill ${pctClass(x.pct)}">atendeu ${fmt(x.pct, 0)}%</span>${x.legivel === false ? `<span class="pill warn">leitura incerta</span>` : ""}</div>
+        <div class="row small"><span class="pill ${pctClass(x.pct)}">atendeu ${fmt(x.pct, 0)}%</span>${x.legivel === false ? `<span class="pill warn">leitura incerta</span>` : ""}<span class="grow"></span>${c.escolher ? `<button class="ghost" data-conta="${i}">${contaQ(x) ? "Não contar" : "Contar"}</button>` : ""}</div>
         ${x.obs ? `<div class="obs" style="margin-top:6px" dir="auto">${esc(x.obs)}</div>` : ""}
       </div>`).join("")}
     </div>
@@ -777,8 +789,18 @@ async function telaCorrecao(id) {
     if (c.status !== "corrigido") return;
     $$("[data-n]").forEach(inp => inp.onchange = async () => {
       const x = c.questoes[+inp.dataset.n]; x.nota = r2(clamp(num(inp.value) ?? 0, 0, Number(x.valor))); x.pct = x.valor ? Math.round(x.nota / x.valor * 100) : 0;
-      const nota = r2(c.questoes.reduce((s, y) => s + y.nota, 0));
-      try { await q(sb.from("correcoes").update({ questoes: c.questoes, nota, revisado: false }).eq("id", id)); render(true); } catch (e) { falha(e); }
+      await salvarQuestoes();
+    });
+    async function salvarQuestoes() {
+      const cont = c.questoes.filter(contaQ);
+      const nota = r2(cont.reduce((s, y) => s + Number(y.nota), 0)), nota_max = r2(cont.reduce((s, y) => s + Number(y.valor), 0));
+      try { await q(sb.from("correcoes").update({ questoes: c.questoes, nota, nota_max, revisado: false }).eq("id", id)); render(true); } catch (e) { falha(e); }
+    }
+    $$("[data-conta]").forEach(b => b.onclick = async () => {
+      const x = c.questoes[+b.dataset.conta]; x.conta = !contaQ(x);
+      const n = c.questoes.filter(contaQ).length;
+      if (c.escolher && n !== c.escolher) toast(`Atenção: agora contam ${n} questões (o certo são ${c.escolher}).`);
+      await salvarQuestoes();
     });
     $("#cCom").onchange = async e => { try { await q(sb.from("correcoes").update({ comentario: e.target.value }).eq("id", id)); } catch (er) { falha(er); } };
     $("#cCopiar").onclick = async () => { try { await navigator.clipboard.writeText(devolutiva({ ...c, comentario: $("#cCom").value }, am)); toast("Copiado"); } catch { toast("Não foi possível copiar"); } };

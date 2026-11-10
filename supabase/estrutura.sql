@@ -3,8 +3,8 @@
 -- alunos(id, owner, disciplina_id -> disciplinas, nome, created_at)
 -- provas(id, owner, disciplina_id -> disciplinas, titulo, data, gabarito, valor_padrao, instrucoes, analise,
 --        modelo, modelo_fotos[], gabarito_fotos[], created_at)
--- correcoes(id, owner, prova_id -> provas, aluno_id -> alunos (null se não identificado), nome_lido, nome_incerto,
---           status [pendente|corrigindo|corrigido|erro], questoes jsonb [{q, valor, pct, nota, resposta, legivel, obs}],
+-- correcoes(id, owner, prova_id -> provas, aluno_id -> alunos (null se não identificado), nome_lido, nome_incerto, escolher (N quando o aluno escolhe N de M questões),
+--           status [pendente|corrigindo|corrigido|erro], questoes jsonb [{q, valor, pct, nota, resposta, legivel, obs, respondeu, conta}],
 --           nota, nota_max, comentario, revisado, fotos[], erro, created_at, updated_at)
 -- usuarios_autorizados(email)  -- quem pode usar a IA (lido só pelo servidor)
 -- RLS: cada tabela só deixa o dono (owner = auth.uid()) ler/escrever.

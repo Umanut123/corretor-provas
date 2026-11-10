@@ -12,7 +12,9 @@ const json = (body: unknown, status = 200) =>
 
 const MODELO = Deno.env.get("MODELO") || "claude-opus-5-5";
 
-async function claude(texto: string, imagens: { data: string; type: string }[], maxTokens = 8000) {
+const MODELO_RAPIDO = Deno.env.get("MODELO_RAPIDO") || "claude-haiku-5-5";
+
+async function claude(texto: string, imagens: { data: string; type: string }[], maxTokens = 8000, modelo = MODELO) {
   const key = Deno.env.get("ANTHROPIC_API_KEY");
   if (!key) throw new Error("A chave da Anthropic (ANTHROPIC_API_KEY) não foi configurada no Supabase.");
   const content = [
@@ -22,7 +24,7 @@ async function claude(texto: string, imagens: { data: string; type: string }[], 
   const r = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
     headers: { "x-api-key": key, "anthropic-version": "2023-06-01", "content-type": "application/json" },
-    body: JSON.stringify({ model: MODELO, max_tokens: maxTokens, messages: [{ role: "user", content }] }),
+    body: JSON.stringify({ model: modelo, max_tokens: maxTokens, messages: [{ role: "user", content }] }),
   });
   const body = await r.json();
   if (!r.ok) {
@@ -78,10 +80,35 @@ O QUE FAZER
 4. "valor": quantos pontos a questão vale segundo o gabarito; se o gabarito não disser, null.
 5. "obs": em português, 1–2 frases dizendo o que a resposta contemplou e o que faltou.
 6. Se não conseguir ler um trecho com segurança, "legivel": false e explique em "obs". Nunca invente o que o aluno escreveu.
-7. "comentario": devolutiva para o aluno, em português, falando com "você", 2 a 4 frases, respeitosa e encorajadora.
+7. ESCOLHA DE QUESTÕES: leia as ORIENTAÇÕES DO PROFESSOR. Se elas disserem que o aluno deve escolher/responder só algumas questões (ex.: "responder 10 de 15", "o aluno responde 10 de todas", "escolha 3"), informe esse número em "responder_n". Se o aluno deve responder todas, "responder_n": null.
+   Mesmo assim, liste TODAS as questões do gabarito em "questoes" e marque em cada uma "respondeu": true se o aluno tentou responder (qualquer coisa escrita, mesmo ilegível ou errada) ou false se deixou em branco. O sistema vai contar só as escolhidas.
+8. "comentario": devolutiva para o aluno, em português, falando com "você", 2 a 4 frases, respeitosa e encorajadora.
 
 Responda SOMENTE com JSON:
-{"nome_lido": "…", "aluno_id": "uuid ou null", "nome_incerto": false, "questoes": [{"q": "1", "valor": 10, "resposta": "…", "legivel": true, "pct": 80, "obs": "…"}], "comentario": "…"}`;
+{"nome_lido": "…", "aluno_id": "uuid ou null", "nome_incerto": false, "responder_n": null, "questoes": [{"q": "1", "valor": 10, "respondeu": true, "resposta": "…", "legivel": true, "pct": 80, "obs": "…"}], "comentario": "…"}`;
+}
+
+// Quantas questões o aluno deve escolher, lido das orientações do professor (ex.: "responde 10 de 15").
+function nDasInstrucoes(txt: string): number | null {
+  const t = (txt || "").toLowerCase();
+  const m = t.match(/(\d+)\s*(?:de|das|dentre|entre|questões de|perguntas de)\s*(?:\d+|todas|todos|as\s+\d+)/)
+    || t.match(/(?:escolher|escolhe|escolha|responder|responde|responda)\s*(?:somente|só|apenas)?\s*(\d+)/);
+  return m ? parseInt(m[1]) : null;
+}
+
+// Marca quais questões contam na nota quando o aluno escolhe N de M.
+// Contam as N questões respondidas com MAIOR nota (a favor do aluno); se respondeu menos de N, completa com as em branco (nota 0).
+function aplicarEscolha(questoes: any[], n: number | null) {
+  questoes.forEach((q) => (q.conta = true));
+  if (!n || n <= 0 || n >= questoes.length) return null;
+  const ordem = questoes.map((q, i) => ({ q, i })).sort((a, b) =>
+    (Number(b.q.respondeu) - Number(a.q.respondeu)) || (b.q.nota - a.q.nota) || (a.i - b.i));
+  ordem.forEach((o, k) => (o.q.conta = k < n));
+  return n;
+}
+function totais(questoes: any[]) {
+  const c = questoes.filter((q) => q.conta !== false);
+  return { nota: r2(c.reduce((s, q) => s + q.nota, 0)), nota_max: r2(c.reduce((s, q) => s + q.valor, 0)) };
 }
 
 Deno.serve(async (req) => {
@@ -126,6 +153,25 @@ Se algum trecho estiver ilegível, escreva [ilegível]. Responda só com a trans
       return json({ texto: texto.trim() });
     }
 
+    // ---------- ler só o nome (rápido, logo depois de enviar as fotos) ----------
+    if (body.acao === "ler_nome") {
+      const { data: c } = await sb.from("correcoes").select("id,prova_id,fotos,aluno_id,status").eq("id", body.correcao_id).single();
+      if (!c || !c.fotos?.length) return json({ erro: "Correção não encontrada." }, 404);
+      const { data: prova } = await sb.from("provas").select("disciplina_id").eq("id", c.prova_id).single();
+      const { data: alunos } = await sb.from("alunos").select("id,nome").eq("disciplina_id", prova.disciplina_id).order("nome");
+      const imgs = await baixarFotos(sb, [c.fotos[0]]);
+      const res = parseJSON(await claude(`A imagem é a primeira página de uma prova manuscrita. Ache o nome do aluno (geralmente no topo, ao lado de "Nome:"; pode estar em hebraico, português ou misturado).
+ALUNOS CADASTRADOS (id: nome):
+${(alunos || []).map((a) => `${a.id}: ${a.nome}`).join("\n") || "(nenhum)"}
+Se o nome corresponder a um aluno da lista (mesmo em outro alfabeto, apelido, abreviação ou com erro de grafia), informe o id. Responda SOMENTE com JSON: {"nome_lido": "como está escrito ou null", "aluno_id": "uuid ou null", "nome_incerto": false}`, imgs, 400, MODELO_RAPIDO));
+      const ids = new Set((alunos || []).map((a) => a.id));
+      const alunoId = res.aluno_id && ids.has(res.aluno_id) ? res.aluno_id : null;
+      const upd: Record<string, unknown> = { nome_lido: res.nome_lido ? String(res.nome_lido) : null, nome_incerto: !!res.nome_incerto || (!alunoId && !!res.nome_lido) };
+      if (!c.aluno_id && alunoId) upd.aluno_id = alunoId;
+      const { data: saved } = await sb.from("correcoes").update(upd).eq("id", c.id).neq("status", "corrigido").select().maybeSingle();
+      return json({ correcao: saved });
+    }
+
     // ---------- corrigir a prova de um aluno ----------
     if (body.acao === "corrigir") {
       const { data: c, error: e1 } = await sb.from("correcoes").select("*").eq("id", body.correcao_id).single();
@@ -144,15 +190,19 @@ Se algum trecho estiver ilegível, escreva [ilegível]. Responda só com a trans
         const questoes = (Array.isArray(res.questoes) ? res.questoes : []).map((q: any, i: number) => {
           const valor = (num(q?.valor) ?? 0) > 0 ? num(q.valor)! : padrao;
           const pct = Math.max(0, Math.min(100, Math.round(num(q?.pct) ?? 0)));
-          return { q: String(q?.q ?? i + 1), valor, pct, nota: r2(valor * pct / 100), resposta: String(q?.resposta ?? ""), legivel: q?.legivel !== false, obs: String(q?.obs ?? "") };
+          const resposta = String(q?.resposta ?? "");
+          const respondeu = q?.respondeu === false ? false : (q?.respondeu === true || resposta.trim().length > 2);
+          return { q: String(q?.q ?? i + 1), valor, pct, nota: r2(valor * pct / 100), resposta, legivel: q?.legivel !== false, obs: String(q?.obs ?? ""), respondeu };
         });
+        const nIA = num(res.responder_n);
+        const nEsc = nIA && nIA > 0 ? Math.round(nIA) : nDasInstrucoes(prova.instrucoes);
+        const escolher = aplicarEscolha(questoes, nEsc);
         if (!questoes.length) throw new Error("A IA não encontrou as questões. Confira o gabarito e as fotos.");
         const ids = new Set((alunos || []).map((a) => a.id));
         const alunoId = c.aluno_id || (res.aluno_id && ids.has(res.aluno_id) ? res.aluno_id : null);
         const upd = {
           status: "corrigido", erro: null, questoes,
-          nota: r2(questoes.reduce((s: number, q: any) => s + q.nota, 0)),
-          nota_max: r2(questoes.reduce((s: number, q: any) => s + q.valor, 0)),
+          ...totais(questoes), escolher,
           comentario: String(res.comentario || ""), nome_lido: res.nome_lido ? String(res.nome_lido) : null,
           nome_incerto: !!res.nome_incerto || (!alunoId && !!res.nome_lido), aluno_id: alunoId, revisado: false,
         };
@@ -169,7 +219,7 @@ Se algum trecho estiver ilegível, escreva [ilegível]. Responda só com a trans
       const { data: prova } = await sb.from("provas").select("*").eq("id", body.prova_id).single();
       const { data: cs } = await sb.from("correcoes").select("questoes,nota,nota_max").eq("prova_id", body.prova_id).eq("status", "corrigido");
       const porQ: Record<string, { valor: number; notas: number[]; obs: string[] }> = {};
-      for (const c of cs || []) for (const q of c.questoes || []) {
+      for (const c of cs || []) for (const q of (c.questoes || []).filter((x: any) => x.conta !== false)) {
         (porQ[q.q] ||= { valor: q.valor, notas: [], obs: [] }).notas.push(q.nota);
         if (q.obs && porQ[q.q].obs.length < 15) porQ[q.q].obs.push(q.obs);
       }
