@@ -160,35 +160,16 @@ function escolherArquivos(accept, multiple = true) {
 // Abre a câmera em tela cheia. Cada aluno pode ter várias páginas.
 // onAluno(blobs) é chamado sempre que um aluno é concluído (para já enviar e corrigir).
 async function abrirCamera({ titulo = "Fotografar", umSo = false, onAluno, onAnexar, rotuloConcluir }) {
-  let stream;
-  try {
-    stream = await navigator.mediaDevices.getUserMedia({ audio: false, video: { facingMode: { ideal: "environment" }, width: { ideal: 4096 }, height: { ideal: 3072 } } });
-  } catch (e) {
-    console.warn(e);
-    toast("Não consegui abrir a câmera aqui; usando a câmera do celular.");
-    const fs = await new Promise(res => { const i = document.createElement("input"); i.type = "file"; i.accept = "image/*"; i.capture = "environment"; i.onchange = () => res([...i.files]); i.click(); });
-    if (fs.length) { const bs = await Promise.all(fs.map(async f => reduzir(await createImageBitmap(f)))); await aceitarFoto(bs[0]) ? onAluno(bs) : toast("Toque de novo para tirar outra foto."); }
-    return;
-  }
-  const track = stream.getVideoTracks()[0];
-  let imageCapture = null; try { if ("ImageCapture" in window) imageCapture = new ImageCapture(track); } catch { }
-  // Foco automático contínuo (quando o celular permite).
-  const caps = (() => { try { return track.getCapabilities?.() || {}; } catch { return {}; } })();
-  const focar = async (x, y) => {
-    try {
-      const modos = caps.focusMode || [];
-      if (x != null && modos.includes("single-shot")) {
-        await track.applyConstraints({ advanced: [{ pointsOfInterest: [{ x, y }], focusMode: "single-shot" }] });
-        setTimeout(() => { if (modos.includes("continuous")) track.applyConstraints({ advanced: [{ focusMode: "continuous" }] }).catch(() => { }); }, 1500);
-      } else if (modos.includes("continuous")) await track.applyConstraints({ advanced: [{ focusMode: "continuous" }] });
-    } catch { }
+  // Usa SEMPRE a câmera normal do celular (foco e nitidez melhores). Esta tela só organiza as páginas de cada aluno.
+  // Abre a câmera do celular; as fotos chegam em "onchange" (pode demorar, por isso não trava o botão).
+  const fotografar = () => {
+    const i = document.createElement("input"); i.type = "file"; i.accept = "image/*"; i.capture = "environment";
+    i.onchange = () => receber([...i.files]); i.click();
   };
-  focar();
   const el = document.createElement("div"); el.className = "cam";
   el.innerHTML = `
-    <video playsinline autoplay muted></video>
-    <div class="flash"></div>
-    <div class="topbar"><button class="ico" data-a="fechar">✕</button><div class="grow" id="camInfo"></div><button class="side" data-a="nativa" style="background:rgba(255,255,255,.18);color:#fff;border:none">📷 Câmera do celular</button>${onAnexar ? `<button class="side" data-a="anexar" style="background:rgba(255,255,255,.18);color:#fff;border:none">📎 Anexar arquivo</button>` : ""}</div>
+    <div class="topbar"><button class="ico" data-a="fechar">✕</button><div class="grow" id="camInfo"></div>${onAnexar ? `<button class="side" data-a="anexar" style="background:rgba(255,255,255,.18);color:#fff;border:none">📎 Anexar arquivo</button>` : ""}</div>
+    <div class="camvazio" id="camPrev"></div>
     <div class="bottom">
       <div class="strip" id="camStrip"></div>
       <div class="ctrl">
@@ -198,41 +179,28 @@ async function abrirCamera({ titulo = "Fotografar", umSo = false, onAluno, onAne
       </div>
     </div>`;
   document.body.append(el);
-  const video = $("video", el); video.srcObject = stream;
-  // Toque na imagem para focar naquele ponto.
-  video.addEventListener("click", e => {
-    const r = video.getBoundingClientRect(); focar((e.clientX - r.left) / r.width, (e.clientY - r.top) / r.height);
-    const f = document.createElement("div"); f.className = "foco"; f.style.left = e.clientX + "px"; f.style.top = e.clientY + "px"; el.append(f); setTimeout(() => f.remove(), 900);
-  });
   let paginas = [], alunosFeitos = 0, ocupado = false;
   const info = () => {
     $("#camInfo", el).innerHTML = `<b>${esc(titulo)}</b><br><span class="small">${umSo ? "" : `Aluno ${alunosFeitos + 1} · `}${paginas.length} página(s)${alunosFeitos ? ` · ${alunosFeitos} aluno(s) enviados` : ""}</span>`;
-    $("#camStrip", el).innerHTML = paginas.map(p => `<img src="${p.url}">`).join("") || `<span class="small" style="opacity:.7;align-self:center">Enquadre a página inteira, com boa luz. Toque na imagem para focar e depois no botão.</span>`;
+    $("#camStrip", el).innerHTML = paginas.map(p => `<img src="${p.url}">`).join("");
+    const ult = paginas[paginas.length - 1];
+    $("#camPrev", el).innerHTML = ult ? `<img src="${ult.url}">` : `<div>Toque no botão redondo para abrir a câmera do celular.<br><br>Fotografe uma página de cada vez, com boa luz e a folha inteira aparecendo.${umSo ? "" : "<br><br>Quando terminar as páginas de um aluno, toque em “Próximo aluno”."}</div>`;
   };
   info();
   const concluirAluno = () => { if (!paginas.length) return false; const blobs = paginas.map(p => p.blob); paginas.forEach(p => URL.revokeObjectURL(p.url)); paginas = []; alunosFeitos++; onAluno(blobs); return true; };
-  const fechar = () => { stream.getTracks().forEach(t => t.stop()); el.remove(); };
+  const fechar = () => { paginas.forEach(p => URL.revokeObjectURL(p.url)); el.remove(); };
+  const receber = async fs => {
+    ocupado = true;
+    try {
+      for (const f of fs) { const blob = await reduzir(await createImageBitmap(f)); if (await aceitarFoto(blob)) { paginas.push({ blob, url: URL.createObjectURL(blob) }); navigator.vibrate?.(30); } }
+    } catch (err) { falha(err); }
+    ocupado = false; info();
+  };
+  const tirar = () => { if (!ocupado) fotografar(); };
   el.onclick = async e => {
     const a = e.target.closest("[data-a]")?.dataset.a; if (!a || ocupado) return;
-    if (a === "foto") {
-      ocupado = true; const fl = $(".flash", el); fl.classList.add("on"); setTimeout(() => fl.classList.remove("on"), 120);
-      try {
-        let blob;
-        if (imageCapture) { try { blob = await reduzir(await createImageBitmap(await imageCapture.takePhoto())); } catch { blob = null; } }
-        if (!blob) blob = await reduzir(video);
-        navigator.vibrate?.(30);
-        if (await aceitarFoto(blob)) paginas.push({ blob, url: URL.createObjectURL(blob) });
-      } catch (err) { falha(err); }
-      ocupado = false; info();
-    } else if (a === "nativa") {
-      // Câmera normal do celular (foco e tratamento de imagem melhores). As fotos entram como páginas deste aluno.
-      ocupado = true;
-      try {
-        const fs = await new Promise(res => { const i = document.createElement("input"); i.type = "file"; i.accept = "image/*"; i.capture = "environment"; i.onchange = () => res([...i.files]); i.click(); });
-        for (const f of fs) { const blob = await reduzir(await createImageBitmap(f)); if (await aceitarFoto(blob)) paginas.push({ blob, url: URL.createObjectURL(blob) }); }
-      } catch (err) { falha(err); }
-      ocupado = false; info();
-    } else if (a === "desfazer") { const p = paginas.pop(); if (p) URL.revokeObjectURL(p.url); info(); }
+    if (a === "foto") tirar();
+    else if (a === "desfazer") { const p = paginas.pop(); if (p) URL.revokeObjectURL(p.url); info(); }
     else if (a === "proximo") {
       if (!paginas.length) { toast("Tire pelo menos uma foto."); return; }
       concluirAluno(); if (umSo) fechar(); else { info(); toast("Enviado. Pode fotografar o próximo aluno."); }
@@ -243,6 +211,7 @@ async function abrirCamera({ titulo = "Fotografar", umSo = false, onAluno, onAne
       fechar();
     }
   };
+  if (navigator.userActivation?.isActive !== false) tirar();   // já abre a câmera do celular (se o celular deixar)
 }
 
 // ================= estado / dados =================
