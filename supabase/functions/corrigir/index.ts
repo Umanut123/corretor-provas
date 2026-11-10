@@ -97,13 +97,14 @@ function nDasInstrucoes(txt: string): number | null {
 }
 
 // Marca quais questões contam na nota quando o aluno escolhe N de M.
-// Contam as N questões respondidas com MAIOR nota (a favor do aluno); se respondeu menos de N, completa com as em branco (nota 0).
+// Contam só as questões que o aluno respondeu (no máximo N, as de MAIOR nota, a favor do aluno).
+// Questões em branco NUNCA contam (orientação do professor).
 function aplicarEscolha(questoes: any[], n: number | null) {
   questoes.forEach((q) => (q.conta = true));
   if (!n || n <= 0 || n >= questoes.length) return null;
   const ordem = questoes.map((q, i) => ({ q, i })).sort((a, b) =>
     (Number(b.q.respondeu) - Number(a.q.respondeu)) || (b.q.nota - a.q.nota) || (a.i - b.i));
-  ordem.forEach((o, k) => (o.q.conta = k < n));
+  ordem.forEach((o, k) => (o.q.conta = k < n && o.q.respondeu !== false));
   return n;
 }
 function totais(questoes: any[]) {
