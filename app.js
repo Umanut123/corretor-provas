@@ -290,6 +290,12 @@ const C = (tab, id) => S.cache[tab + ":" + id];
 const put = (tab, rows) => { (Array.isArray(rows) ? rows : [rows]).forEach(r => r && (S.cache[tab + ":" + r.id] = r)); return rows; };
 const contaQ = x => x && x.conta !== false;   // questão entra na nota (quando o aluno escolhe N de M, as outras não contam)
 const nomeCorr = (c, alunosMap) => (c.aluno_id && alunosMap?.[c.aluno_id]?.nome) || c.nome_lido || "(nome não identificado)";
+// Ordem alfabética (A → Z); provas sem nome identificado ficam no fim, na ordem em que foram enviadas.
+const porNome = (cs, am) => [...cs].sort((a, b) => {
+  const na = (a.aluno_id && am?.[a.aluno_id]?.nome) || a.nome_lido || "", nb = (b.aluno_id && am?.[b.aluno_id]?.nome) || b.nome_lido || "";
+  if (!na || !nb) return !na && !nb ? String(a.created_at).localeCompare(String(b.created_at)) : na ? -1 : 1;
+  return na.localeCompare(nb, "pt-BR", { sensitivity: "base" });
+});
 
 async function enviarFotos(provaId, correcaoId, blobs) {
   const paths = [];
@@ -775,7 +781,7 @@ function abaCorrigir(p, cs, am) {
     </div>
     ${pend.length ? `<button class="big" id="cPend" style="margin-bottom:12px">Corrigir pendentes (${pend.length})</button>` : ""}
     ${btnRevisarTudo(cs)}
-    <div class="card">${cs.length ? cs.map(c => `
+    <div class="card">${cs.length ? porNome(cs, am).map(c => `
       <div class="item" data-go="#/c/${c.id}"><div class="grow"><div class="t" dir="auto">${esc(nomeCorr(c, am))}</div>
         <div class="s">${c.status === "corrigido" ? (c.revisado ? "revisado" : "a revisar") : c.status === "erro" ? esc(c.erro || "erro") : `${c.fotos.length} página(s)`}
         ${c.status === "corrigido" && !c.aluno_id ? ` · <span style="color:var(--warn)">aluno não vinculado</span>` : ""}${c.aluno_id && contagem[c.aluno_id] > 1 ? ` · <span style="color:var(--bad)">duplicado</span>` : ""}</div></div>
@@ -905,11 +911,12 @@ async function telaCorrecao(id) {
   const c = put("correcoes", await q(sb.from("correcoes").select("*").eq("id", id).single()));
   if (S.rodandoIds.has(id)) c.status = "corrigindo";
   const p = put("provas", await q(sb.from("provas").select("id,titulo,disciplina_id").eq("id", c.prova_id).single()));
-  const [as, irmas] = await Promise.all([
+  let [as, irmas] = await Promise.all([
     q(sb.from("alunos").select("id,nome").eq("disciplina_id", p.disciplina_id).order("nome")),
-    q(sb.from("correcoes").select("id,aluno_id,nome_lido,status,revisado").eq("prova_id", p.id).order("created_at")),   // mesma ordem da lista "Corrigir"
+    q(sb.from("correcoes").select("id,aluno_id,nome_lido,status,revisado,created_at").eq("prova_id", p.id).order("created_at")),
   ]);
   const am = Object.fromEntries(as.map(a => [a.id, a]));
+  irmas = porNome(irmas, am);   // mesma ordem (A → Z) da lista "Corrigir"
   const o = S.origemCorrecao || "", pai = o.startsWith(`#/p/${p.id}`) || o.startsWith("#/a/") ? o : `#/p/${p.id}/corrigir`;
   cabecalho(nomeCorr(c, am), pai);
   const pos = irmas.findIndex(y => y.id === id), ant = irmas[pos - 1], prox = irmas[pos + 1];
