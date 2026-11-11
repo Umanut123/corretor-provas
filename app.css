@@ -86,3 +86,12 @@ td{padding:8px 6px;border-bottom:1px solid var(--line);vertical-align:top}
 .cam .topbar .side{font-size:13px;padding:8px 10px;white-space:nowrap}
 .cam .camvazio{flex:1;min-height:0;display:flex;align-items:center;justify-content:center;padding:80px 24px 10px;color:#fff;text-align:center;font-size:15px;line-height:1.4}
 .cam .camvazio img{max-width:100%;max-height:100%;object-fit:contain;border-radius:6px}
+
+/* por questão / navegação entre alunos */
+.chips{display:flex;gap:6px;overflow-x:auto;padding:0 0 10px;margin-bottom:2px}
+.chips button{flex:none;padding:8px 14px;border-radius:99px;font-size:14px}
+.chips button.on{background:var(--accent);border-color:var(--accent);color:#fff}
+.navbar{position:fixed;left:14px;right:14px;bottom:calc(14px + env(safe-area-inset-bottom));max-width:832px;margin:0 auto;z-index:9;display:flex;gap:8px}
+.navbar button{padding:15px 18px;font-size:17px;box-shadow:0 6px 20px rgba(0,0,0,.18)}
+.navbar button.grow{flex:1}
+.navbar button:disabled{opacity:1;color:#cfccc4}

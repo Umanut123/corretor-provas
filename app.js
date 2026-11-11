@@ -157,19 +157,63 @@ function escolherArquivos(accept, multiple = true) {
 }
 
 // ================= câmera =================
-// Abre a câmera em tela cheia. Cada aluno pode ter várias páginas.
+// Escolhe a lente traseira PRINCIPAL. Em celulares com várias câmeras, "environment" às vezes pega a grande-angular
+// (foco fixo, foto borrada). No Android a principal costuma ser "camera2 0, facing back".
+const numLente = d => { const m = (d.label || "").match(/(\d+)/); return m ? +m[1] : 99; };
+async function lentesTraseiras() {
+  try {
+    const ds = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === "videoinput");
+    return ds.filter(d => /back|rear|traseira|environment/i.test(d.label)).sort((a, b) => numLente(a) - numLente(b));
+  } catch { return []; }
+}
+const lsGet = k => { try { return localStorage.getItem(k); } catch { return null; } };
+const lsSet = (k, v) => { try { v == null ? localStorage.removeItem(k) : localStorage.setItem(k, v); } catch { } };
+const RES = { width: { ideal: 4096 }, height: { ideal: 3072 } };
+async function abrirStream(deviceId) {
+  const gum = video => navigator.mediaDevices.getUserMedia({ audio: false, video });
+  if (deviceId) { try { return await gum({ deviceId: { exact: deviceId }, ...RES }); } catch { } }
+  try { return await gum({ facingMode: { exact: "environment" }, ...RES }); } catch { }
+  return await gum({ facingMode: { ideal: "environment" }, ...RES });   // computador ou celular sem câmera traseira
+}
+// Abre a câmera em tela cheia (sempre a traseira). Cada aluno pode ter várias páginas.
 // onAluno(blobs) é chamado sempre que um aluno é concluído (para já enviar e corrigir).
 async function abrirCamera({ titulo = "Fotografar", umSo = false, onAluno, onAnexar, rotuloConcluir }) {
-  // Usa SEMPRE a câmera normal do celular (foco e nitidez melhores). Esta tela só organiza as páginas de cada aluno.
-  // Abre a câmera do celular; as fotos chegam em "onchange" (pode demorar, por isso não trava o botão).
-  const fotografar = () => {
-    const i = document.createElement("input"); i.type = "file"; i.accept = "image/*"; i.capture = "environment";
-    i.onchange = () => receber([...i.files]); i.click();
+  const nativa = () => new Promise(res => {
+    const i = document.createElement("input"); i.type = "file"; i.accept = "image/*"; i.setAttribute("capture", "environment");
+    i.onchange = () => res([...i.files]); i.click();
+  });
+  let stream = null, track = null, imageCapture = null, caps = {}, lentes = [];
+  const ligar = async deviceId => {
+    stream?.getTracks().forEach(t => t.stop());
+    stream = await abrirStream(deviceId); track = stream.getVideoTracks()[0];
+    try { imageCapture = "ImageCapture" in window ? new ImageCapture(track) : null; } catch { imageCapture = null; }
+    try { caps = track.getCapabilities?.() || {}; } catch { caps = {}; }
+    focar();
   };
+  const focar = async (x, y) => {
+    try {
+      const modos = caps.focusMode || [];
+      if (x != null && modos.includes("single-shot")) {
+        await track.applyConstraints({ advanced: [{ pointsOfInterest: [{ x, y }], focusMode: "single-shot" }] });
+        setTimeout(() => { if (modos.includes("continuous")) track.applyConstraints({ advanced: [{ focusMode: "continuous" }] }).catch(() => { }); }, 1500);
+      } else if (modos.includes("continuous")) await track.applyConstraints({ advanced: [{ focusMode: "continuous" }] });
+    } catch { }
+  };
+  try {
+    await ligar(lsGet("lenteCamera"));
+    // Na primeira vez (ou se a lente salva sumiu), troca para a lente traseira principal.
+    lentes = await lentesTraseiras();
+    const atual = track.getSettings?.().deviceId;
+    if (lentes.length && !lentes.some(l => l.deviceId === lsGet("lenteCamera"))) { lsSet("lenteCamera", lentes[0].deviceId); if (lentes[0].deviceId !== atual) await ligar(lentes[0].deviceId); }
+  } catch (e) {
+    console.warn(e); stream?.getTracks().forEach(t => t.stop()); stream = null;
+  }
   const el = document.createElement("div"); el.className = "cam";
+  const btnTopo = (a, t) => `<button class="side" data-a="${a}" style="background:rgba(255,255,255,.18);color:#fff;border:none">${t}</button>`;
   el.innerHTML = `
-    <div class="topbar"><button class="ico" data-a="fechar">✕</button><div class="grow" id="camInfo"></div>${onAnexar ? `<button class="side" data-a="anexar" style="background:rgba(255,255,255,.18);color:#fff;border:none">📎 Anexar arquivo</button>` : ""}</div>
-    <div class="camvazio" id="camPrev"></div>
+    ${stream ? `<video playsinline autoplay muted></video><div class="flash"></div>` : `<div class="camvazio" id="camPrev"></div>`}
+    <div class="topbar"><button class="ico" data-a="fechar">✕</button><div class="grow" id="camInfo"></div>
+      ${stream && lentes.length > 1 ? btnTopo("lente", "🔄 Lente") : ""}${stream && (caps.torch) ? btnTopo("luz", "💡") : ""}${btnTopo("nativa", "📱 Câmera do celular")}${onAnexar ? btnTopo("anexar", "📎 Arquivo") : ""}</div>
     <div class="bottom">
       <div class="strip" id="camStrip"></div>
       <div class="ctrl">
@@ -179,27 +223,54 @@ async function abrirCamera({ titulo = "Fotografar", umSo = false, onAluno, onAne
       </div>
     </div>`;
   document.body.append(el);
-  let paginas = [], alunosFeitos = 0, ocupado = false;
+  const video = $("video", el);
+  if (video) {
+    video.srcObject = stream;
+    video.addEventListener("click", e => {   // toque na imagem para focar naquele ponto
+      const r = video.getBoundingClientRect(); focar((e.clientX - r.left) / r.width, (e.clientY - r.top) / r.height);
+      const f = document.createElement("div"); f.className = "foco"; f.style.left = e.clientX + "px"; f.style.top = e.clientY + "px"; el.append(f); setTimeout(() => f.remove(), 900);
+    });
+  }
+  let paginas = [], alunosFeitos = 0, ocupado = false, luz = false;
   const info = () => {
-    $("#camInfo", el).innerHTML = `<b>${esc(titulo)}</b><br><span class="small">${umSo ? "" : `Aluno ${alunosFeitos + 1} · `}${paginas.length} página(s)${alunosFeitos ? ` · ${alunosFeitos} aluno(s) enviados` : ""}</span>`;
-    $("#camStrip", el).innerHTML = paginas.map(p => `<img src="${p.url}">`).join("");
-    const ult = paginas[paginas.length - 1];
-    $("#camPrev", el).innerHTML = ult ? `<img src="${ult.url}">` : `<div>Toque no botão redondo para abrir a câmera do celular.<br><br>Fotografe uma página de cada vez, com boa luz e a folha inteira aparecendo.${umSo ? "" : "<br><br>Quando terminar as páginas de um aluno, toque em “Próximo aluno”."}</div>`;
+    $("#camInfo", el).innerHTML = `<b>${esc(titulo)}</b><br><span class="small">${umSo ? "" : `Aluno ${alunosFeitos + 1} · `}${paginas.length} página(s)${alunosFeitos ? ` · ${alunosFeitos} enviado(s)` : ""}</span>`;
+    $("#camStrip", el).innerHTML = paginas.map(p => `<img src="${p.url}">`).join("") || `<span class="small" style="opacity:.7;align-self:center">Enquadre a página inteira, com boa luz. Toque na imagem para focar e depois no botão redondo.</span>`;
+    const prev = $("#camPrev", el);
+    if (prev) { const ult = paginas[paginas.length - 1]; prev.innerHTML = ult ? `<img src="${ult.url}">` : `<div>Não consegui abrir a câmera aqui dentro.<br><br>Toque no botão redondo para usar a câmera do celular.</div>`; }
   };
   info();
   const concluirAluno = () => { if (!paginas.length) return false; const blobs = paginas.map(p => p.blob); paginas.forEach(p => URL.revokeObjectURL(p.url)); paginas = []; alunosFeitos++; onAluno(blobs); return true; };
-  const fechar = () => { paginas.forEach(p => URL.revokeObjectURL(p.url)); el.remove(); };
-  const receber = async fs => {
-    ocupado = true;
-    try {
-      for (const f of fs) { const blob = await reduzir(await createImageBitmap(f)); if (await aceitarFoto(blob)) { paginas.push({ blob, url: URL.createObjectURL(blob) }); navigator.vibrate?.(30); } }
-    } catch (err) { falha(err); }
+  const fechar = () => { stream?.getTracks().forEach(t => t.stop()); paginas.forEach(p => URL.revokeObjectURL(p.url)); el.remove(); };
+  const guardar = async blob => { if (await aceitarFoto(blob)) { paginas.push({ blob, url: URL.createObjectURL(blob) }); navigator.vibrate?.(30); } };
+  const daNativa = async () => {
+    const fs = await nativa(); ocupado = true;
+    try { for (const f of fs) await guardar(await reduzir(await createImageBitmap(f))); } catch (err) { falha(err); }
     ocupado = false; info();
   };
-  const tirar = () => { if (!ocupado) fotografar(); };
   el.onclick = async e => {
     const a = e.target.closest("[data-a]")?.dataset.a; if (!a || ocupado) return;
-    if (a === "foto") tirar();
+    if (a === "foto") {
+      if (!video) { daNativa(); return; }
+      ocupado = true; const fl = $(".flash", el); fl.classList.add("on"); setTimeout(() => fl.classList.remove("on"), 120);
+      try {
+        let blob = null;
+        if (imageCapture) { try { blob = await reduzir(await createImageBitmap(await imageCapture.takePhoto())); } catch { blob = null; } }
+        if (!blob) blob = await reduzir(video);
+        await guardar(blob);
+      } catch (err) { falha(err); }
+      ocupado = false; info();
+    } else if (a === "nativa") daNativa();
+    else if (a === "lente") {
+      ocupado = true;
+      try {
+        const atual = track.getSettings?.().deviceId, i = lentes.findIndex(l => l.deviceId === atual), prox = lentes[(i + 1) % lentes.length];
+        await ligar(prox.deviceId); video.srcObject = stream; lsSet("lenteCamera", prox.deviceId);
+        toast(`Lente ${lentes.indexOf(prox) + 1} de ${lentes.length}. Fica salva para as próximas vezes.`);
+      } catch (err) { falha(err); }
+      ocupado = false;
+    } else if (a === "luz") {
+      luz = !luz; try { await track.applyConstraints({ advanced: [{ torch: luz }] }); } catch { } e.target.closest("[data-a]").style.background = luz ? "#ffd54a" : "rgba(255,255,255,.18)";
+    }
     else if (a === "desfazer") { const p = paginas.pop(); if (p) URL.revokeObjectURL(p.url); info(); }
     else if (a === "proximo") {
       if (!paginas.length) { toast("Tire pelo menos uma foto."); return; }
@@ -211,7 +282,6 @@ async function abrirCamera({ titulo = "Fotografar", umSo = false, onAluno, onAne
       fechar();
     }
   };
-  if (navigator.userActivation?.isActive !== false) tirar();   // já abre a câmera do celular (se o celular deixar)
 }
 
 // ================= estado / dados =================
@@ -275,7 +345,11 @@ const edicaoAtiva = () => { const a = document.activeElement; return a && /INPUT
 // ================= roteamento =================
 const rotaAtual = () => location.hash || "#/";
 const ir = h => { if (location.hash === h) render(); else location.hash = h; };
-window.addEventListener("hashchange", () => render());
+window.addEventListener("hashchange", e => {
+  const antiga = "#" + (String(e.oldURL || "").split("#")[1] || "/");
+  if (rotaAtual().startsWith("#/c/") && !antiga.startsWith("#/c/")) S.origemCorrecao = antiga;   // para o "voltar" da correção
+  render();
+});
 $("#voltar").onclick = () => { const p = S.pai; if (p) ir(p); else history.back(); };
 $("#menu").onclick = async () => { if (await confirmar("Sair da sua conta neste celular?", "Sair")) { await sb.auth.signOut(); } };
 
@@ -294,7 +368,7 @@ async function render(silencioso) {
     let html, bind;
     if (!r[0]) [html, bind] = await telaInicio();
     else if (r[0] === "d") [html, bind] = await telaDisciplina(r[1], r[2] || "provas");
-    else if (r[0] === "p") [html, bind] = await telaProva(r[1], r[2] || "corrigir");
+    else if (r[0] === "p") [html, bind] = await telaProva(r[1], r[2] || "corrigir", r[3] != null ? decodeURIComponent(r[3]) : null);
     else if (r[0] === "c") [html, bind] = await telaCorrecao(r[1]);
     else if (r[0] === "a") [html, bind] = await telaAluno(r[1]);
     else { ir("#/"); return; }
@@ -586,11 +660,11 @@ async function telaAluno(id) {
 
 // ================= prova =================
 let modoGaleria = "cada";
-async function telaProva(id, aba) {
+async function telaProva(id, aba, qSel) {
   const p = put("provas", await q(sb.from("provas").select("*, disciplinas(nome)").eq("id", id).single()));
   cabecalho(p.titulo, `#/d/${p.disciplina_id}`);
   if (!p.gabarito.trim() && aba !== "gabarito") aba = "gabarito";
-  const tabs = `<div class="tabs">${[["gabarito", "Gabarito"], ["corrigir", "Corrigir"], ["resultados", "Resultados"]].map(([k, l]) => `<button class="${aba === k ? "on" : ""}" data-go="#/p/${id}/${k}">${l}</button>`).join("")}</div>`;
+  const tabs = `<div class="tabs">${[["gabarito", "Gabarito"], ["corrigir", "Corrigir"], ["questoes", "Por questão"], ["resultados", "Resultados"]].map(([k, l]) => `<button class="${aba === k ? "on" : ""}" data-go="#/p/${id}/${k}">${l}</button>`).join("")}</div>`;
   let r;
   if (aba === "gabarito") r = abaGabarito(p);
   else {
@@ -601,7 +675,7 @@ async function telaProva(id, aba) {
     put("correcoes", cs);
     cs.forEach(c => { if (S.rodandoIds.has(c.id)) c.status = "corrigindo"; });
     const am = Object.fromEntries(as.map(a => [a.id, a]));
-    r = aba === "corrigir" ? abaCorrigir(p, cs, am) : abaResultados(p, cs, am);
+    r = aba === "corrigir" ? abaCorrigir(p, cs, am) : aba === "questoes" ? abaQuestoes(p, cs, am, qSel) : abaResultados(p, cs, am);
   }
   return [tabs + r[0], () => { $$(".tabs [data-go]").forEach(el => el.onclick = () => ir(el.dataset.go)); r[1](); }];
 }
@@ -677,6 +751,16 @@ function statusPill(c) {
   const p = c.nota_max ? c.nota / c.nota_max * 100 : null;
   return `<b>${fmt(c.nota)}</b><span class="small muted">/${fmt(c.nota_max)}</span> <span class="pill ${pctClass(p)}">${fmt(p, 0)}%</span>`;
 }
+// Botão "Revisar tudo": marca todas as provas corrigidas (e ainda não revisadas) desta prova como revisadas.
+const naoRevisadas = cs => cs.filter(c => c.status === "corrigido" && !c.revisado && !S.rodandoIds.has(c.id));
+const btnRevisarTudo = cs => { const n = naoRevisadas(cs).length; return n ? `<button class="big" data-revtudo style="margin-bottom:12px">✓ Revisar tudo (${n} a revisar)</button>` : ""; };
+function bindRevisarTudo(p, cs) {
+  $$("[data-revtudo]").forEach(b => b.onclick = async () => {
+    const ids = naoRevisadas(cs).map(c => c.id); if (!ids.length) return;
+    if (!await confirmar(`Marcar as ${ids.length} prova(s) corrigida(s) como revisadas?`, "Revisar tudo")) return;
+    try { await q(sb.from("correcoes").update({ revisado: true }).in("id", ids)); toast(`${ids.length} prova(s) marcada(s) como revisadas`); render(true); } catch (e) { falha(e); }
+  });
+}
 function abaCorrigir(p, cs, am) {
   const pend = cs.filter(c => (c.status === "pendente" || c.status === "erro") && !S.rodandoIds.has(c.id) && !S.fila.includes(c.id));
   const contagem = {}; cs.forEach(c => { if (c.aluno_id) contagem[c.aluno_id] = (contagem[c.aluno_id] || 0) + 1; });
@@ -690,6 +774,7 @@ function abaCorrigir(p, cs, am) {
       </div>
     </div>
     ${pend.length ? `<button class="big" id="cPend" style="margin-bottom:12px">Corrigir pendentes (${pend.length})</button>` : ""}
+    ${btnRevisarTudo(cs)}
     <div class="card">${cs.length ? cs.map(c => `
       <div class="item" data-go="#/c/${c.id}"><div class="grow"><div class="t" dir="auto">${esc(nomeCorr(c, am))}</div>
         <div class="s">${c.status === "corrigido" ? (c.revisado ? "revisado" : "a revisar") : c.status === "erro" ? esc(c.erro || "erro") : `${c.fotos.length} página(s)`}
@@ -709,6 +794,7 @@ function abaCorrigir(p, cs, am) {
       for (const l of lotes) if (l.length) await novaCorrecao(p, l);
     };
     const pb = $("#cPend"); if (pb) pb.onclick = () => { pend.forEach(c => enfileirar(c.id)); render(true); };
+    bindRevisarTudo(p, cs);
   }];
 }
 
@@ -723,7 +809,7 @@ function abaResultados(p, cs, am) {
   const ord = [...corr].sort((a, b) => nomeCorr(a, am).localeCompare(nomeCorr(b, am), "pt-BR"));
   const naoRev = corr.filter(c => !c.revisado).length;
   const html = `
-    ${naoRev ? `<div class="note">${naoRev} correção(ões) ainda não revisada(s).</div>` : ""}
+    ${naoRev ? `<div class="note">${naoRev} correção(ões) ainda não revisada(s).</div>${btnRevisarTudo(cs)}` : ""}
     <div class="stats">
       <div class="stat"><div class="v">${corr.length}</div><div class="l">provas corrigidas</div></div>
       <div class="stat"><div class="v">${fmt(media)}</div><div class="l">nota média (de ${fmt(maxv)})</div></div>
@@ -735,13 +821,14 @@ function abaResultados(p, cs, am) {
       <tbody>${ord.map(c => `<tr data-go="#/c/${c.id}"><td dir="auto">${esc(nomeCorr(c, am))}${c.revisado ? "" : " <span class='pill warn'>revisar</span>"}</td>${labels.map(l => { const x = c.questoes.find(y => y.q === l); return `<td class="num">${contaQ(x) ? fmt(x.nota) : "–"}</td>`; }).join("")}<td class="num"><b>${fmt(c.nota)}</b><span class="small muted">/${fmt(c.nota_max)}</span></td></tr>`).join("")}</tbody>
     </table></div>
     <div class="row" style="margin-bottom:12px"><button class="grow pri" id="rCsv">📊 Baixar Excel</button><button class="grow" id="rDev">Baixar devolutivas</button></div>
-    <div class="card"><h3>Por questão (da mais difícil)</h3>
-      ${porQ.map(x => `<div style="margin:10px 0"><div class="row"><b class="grow">Questão ${esc(x.l)}</b><span class="small">${x.n < corr.length ? `${x.n} aluno(s) · ` : ""}média ${fmt(x.media)} de ${fmt(x.valor)} · ${fmt(x.pct, 0)}%</span></div>
+    <div class="card"><h3>Por questão (da mais difícil)</h3><p class="small muted" style="margin:-4px 0 0">Toque numa questão para ver a resposta de todos os alunos.</p>
+      ${porQ.map(x => `<div style="margin:10px 0" data-go="#/p/${p.id}/questoes/${encodeURIComponent(x.l)}"><div class="row"><b class="grow">Questão ${esc(x.l)}</b><span class="small">${x.n < corr.length ? `${x.n} aluno(s) · ` : ""}média ${fmt(x.media)} de ${fmt(x.valor)} · ${fmt(x.pct, 0)}%</span></div>
         <div class="bar ${x.pct < 50 ? "lo" : x.pct < 70 ? "mid" : ""}"><i style="width:${x.pct}%"></i></div></div>`).join("")}</div>
     <div class="card"><div class="row"><h3 class="grow" style="margin:0">Análise da turma</h3><button id="rAn">${p.analise ? "Gerar de novo" : "Gerar com IA"}</button></div>
       <div id="rAnTxt" style="white-space:pre-wrap;margin-top:10px">${p.analise ? esc(p.analise) : `<span class="muted small">Pontos fortes, dificuldades e sugestões para a próxima aula.</span>`}</div></div>`;
   return [html, () => {
     $$("[data-go]").forEach(el => el.onclick = () => ir(el.dataset.go));
+    bindRevisarTudo(p, cs);
     $("#rCsv").onclick = () => baixarExcel(`${slug(p.titulo)}-notas.xlsx`, [{ nome: p.titulo, linhas: linhasProva(cs, am) }]);
     $("#rDev").onclick = () => baixarArquivo(`${slug(p.titulo)}-devolutivas.txt`, ord.map(c => devolutiva(c, am)).join("\n\n------------------------------\n\n"), "text/plain;charset=utf-8");
     $("#rAn").onclick = async () => {
@@ -752,6 +839,62 @@ function abaResultados(p, cs, am) {
     };
   }];
 }
+// ================= por questão =================
+// Tenta achar no gabarito o trecho da questão escolhida ("3) …", "3. …", "Questão 3 …") até a próxima questão.
+function trechoGabarito(gab, label) {
+  const linhas = String(gab || "").split("\n"), L = String(label).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const ini = new RegExp(`^\\s*(?:quest[ãa]o\\s*)?${L}\\s*[\\)\\.\\-:–]`, "i"), outra = /^\s*(?:quest[ãa]o\s*)?\d+[a-z]?\s*[\)\.\-:–]/i;
+  const i = linhas.findIndex(l => ini.test(l)); if (i < 0) return "";
+  let j = i + 1; while (j < linhas.length && !outra.test(linhas[j])) j++;
+  return linhas.slice(i, j).join("\n").trim();
+}
+function abaQuestoes(p, cs, am, sel) {
+  const corr = cs.filter(c => c.status === "corrigido").sort((a, b) => nomeCorr(a, am).localeCompare(nomeCorr(b, am), "pt-BR"));
+  if (!corr.length) return [`<div class="empty">Nenhuma prova corrigida ainda.</div>`, () => { }];
+  const labels = []; corr.forEach(c => (c.questoes || []).forEach(x => { if (!labels.includes(String(x.q))) labels.push(String(x.q)); }));
+  if (sel == null || !labels.includes(sel)) sel = labels[0];
+  const k = labels.indexOf(sel);
+  const linhas = corr.map(c => { const i = (c.questoes || []).findIndex(x => String(x.q) === sel); return { c, i, x: i >= 0 ? c.questoes[i] : null }; });
+  const cont = linhas.filter(l => contaQ(l.x));
+  const media = cont.length ? cont.reduce((s, l) => s + Number(l.x.nota), 0) / cont.length : null;
+  const pctM = cont.length ? cont.reduce((s, l) => s + Number(l.x.pct), 0) / cont.length : null;
+  const valor = cont[0]?.x.valor ?? linhas.find(l => l.x)?.x.valor;
+  const gab = trechoGabarito(p.gabarito, sel);
+  const ir2 = l => `#/p/${p.id}/questoes/${encodeURIComponent(l)}`;
+  const html = `
+    <div class="chips">${labels.map(l => `<button class="${l === sel ? "on" : ""}" data-go="${ir2(l)}">Q${esc(l)}</button>`).join("")}</div>
+    <div class="card">
+      <div class="row"><button ${k > 0 ? `data-go="${ir2(labels[k - 1])}"` : "disabled"}>◂</button>
+        <h3 class="grow" style="margin:0;text-align:center">Questão ${esc(sel)} <span class="small muted" style="font-weight:400">· vale ${fmt(valor)}</span></h3>
+        <button ${k < labels.length - 1 ? `data-go="${ir2(labels[k + 1])}"` : "disabled"}>▸</button></div>
+      <div class="row small" style="margin-top:8px;justify-content:center"><span>média ${fmt(media)} de ${fmt(valor)}</span><span class="pill ${pctClass(pctM)}">${fmt(pctM, 0)}%</span><span class="muted">${cont.length} aluno(s)</span></div>
+      ${gab ? `<div class="obs" style="margin-top:10px"><b>Gabarito:</b></div><div class="ans" dir="auto">${esc(gab)}</div>`
+        : (p.gabarito || "").trim() ? `<details style="margin-top:10px"><summary class="small muted">Ver gabarito completo</summary><div class="ans" dir="auto">${esc(p.gabarito)}</div></details>` : ""}
+    </div>
+    <div class="card">${linhas.map(({ c, i, x }) => `<div class="q" ${x && contaQ(x) ? "" : `style="opacity:.55"`}>
+      <div class="row"><b class="grow" dir="auto" data-go="#/c/${c.id}" style="cursor:pointer">${esc(nomeCorr(c, am))} <span class="chev" style="font-size:16px">›</span></b>
+        ${x ? `<input class="notaIn" inputmode="decimal" data-cq="${c.id}" data-i="${i}" value="${esc(fmt(x.nota))}"><span class="small muted">/ ${fmt(x.valor)}</span>` : ""}</div>
+      ${x ? `<div class="ans" dir="auto">${esc(x.resposta || "(em branco)")}</div>
+      <div class="row small"><span class="pill ${pctClass(x.pct)}" data-pct="${c.id}">atendeu ${fmt(x.pct, 0)}%</span>${x.legivel === false ? `<span class="pill warn">leitura incerta</span>` : ""}${contaQ(x) ? "" : `<span class="pill">não conta</span>`}<span class="grow"></span><span class="muted" data-tot="${c.id}">total ${fmt(c.nota)}/${fmt(c.nota_max)}</span>${c.revisado ? `<span class="pill ok">revisado</span>` : ""}</div>
+      ${x.obs ? `<div class="obs" style="margin-top:6px" dir="auto">${esc(x.obs)}</div>` : ""}` : `<div class="small muted">Esta questão não aparece na prova deste aluno.</div>`}
+    </div>`).join("")}</div>
+    ${btnRevisarTudo(cs)}`;
+  return [html, () => {
+    $$("#main [data-go]").forEach(el => el.onclick = () => ir(el.dataset.go));
+    bindRevisarTudo(p, cs);
+    $$("[data-cq]").forEach(inp => inp.onchange = async () => {
+      const c = corr.find(y => y.id === inp.dataset.cq), x = c.questoes[+inp.dataset.i];
+      x.nota = r2(clamp(num(inp.value) ?? 0, 0, Number(x.valor))); x.pct = x.valor ? Math.round(x.nota / x.valor * 100) : 0;
+      const cnt = c.questoes.filter(contaQ);
+      c.nota = r2(cnt.reduce((s, y) => s + Number(y.nota), 0)); c.nota_max = r2(cnt.reduce((s, y) => s + Number(y.valor), 0));
+      inp.value = fmt(x.nota);
+      const pp = $(`[data-pct="${c.id}"]`); if (pp) { pp.className = `pill ${pctClass(x.pct)}`; pp.textContent = `atendeu ${fmt(x.pct, 0)}%`; }
+      const tt = $(`[data-tot="${c.id}"]`); if (tt) tt.textContent = `total ${fmt(c.nota)}/${fmt(c.nota_max)}`;
+      try { await q(sb.from("correcoes").update({ questoes: c.questoes, nota: c.nota, nota_max: c.nota_max }).eq("id", c.id)); toast("Nota salva"); } catch (e) { falha(e); }
+    });
+  }];
+}
+
 function devolutiva(c, am) {
   return `${nomeCorr(c, am)} — ${fmt(c.nota)} de ${fmt(c.nota_max)}\n\n${c.comentario || ""}\n\n` + (c.escolher ? `(Você devia escolher ${c.escolher} questões; contaram as ${c.escolher} melhores.)\n\n` : "") +
     c.questoes.filter(contaQ).map(x => `• Questão ${x.q}: ${fmt(x.nota)} de ${fmt(x.valor)}${x.obs ? ` — ${x.obs}` : ""}`).join("\n");
@@ -762,13 +905,24 @@ async function telaCorrecao(id) {
   const c = put("correcoes", await q(sb.from("correcoes").select("*").eq("id", id).single()));
   if (S.rodandoIds.has(id)) c.status = "corrigindo";
   const p = put("provas", await q(sb.from("provas").select("id,titulo,disciplina_id").eq("id", c.prova_id).single()));
-  const as = await q(sb.from("alunos").select("id,nome").eq("disciplina_id", p.disciplina_id).order("nome"));
+  const [as, irmas] = await Promise.all([
+    q(sb.from("alunos").select("id,nome").eq("disciplina_id", p.disciplina_id).order("nome")),
+    q(sb.from("correcoes").select("id,aluno_id,nome_lido,status,revisado").eq("prova_id", p.id).order("created_at")),   // mesma ordem da lista "Corrigir"
+  ]);
   const am = Object.fromEntries(as.map(a => [a.id, a]));
-  cabecalho(nomeCorr(c, am), `#/p/${p.id}/corrigir`);
+  const o = S.origemCorrecao || "", pai = o.startsWith(`#/p/${p.id}`) || o.startsWith("#/a/") ? o : `#/p/${p.id}/corrigir`;
+  cabecalho(nomeCorr(c, am), pai);
+  const pos = irmas.findIndex(y => y.id === id), ant = irmas[pos - 1], prox = irmas[pos + 1];
+  const marca = y => y.status === "corrigido" ? (y.revisado ? "✓ " : "• ") : "… ";
   let urls = [];
   if (c.fotos.length) { const { data } = await sb.storage.from("provas").createSignedUrls(c.fotos, 3600); urls = (data || []).map(x => x.signedUrl).filter(Boolean); }
   const pctT = c.nota_max ? c.nota / c.nota_max * 100 : null;
   const html = `
+    <div class="card" style="padding:10px 14px">
+      <div class="row"><span class="small muted">Aluno ${pos + 1} de ${irmas.length}</span>
+        <select id="cIr" class="grow" style="padding:8px 10px">${irmas.map(y => `<option value="${y.id}" ${y.id === id ? "selected" : ""}>${esc(marca(y) + nomeCorr(y, am))}</option>`).join("")}</select></div>
+      <div class="small muted" style="margin-top:4px">✓ revisado · • a revisar · … ainda não corrigido</div>
+    </div>
     <div class="card">
       <div class="thumbs">${urls.map(u => `<img src="${u}" data-zoom>`).join("")}</div>
       <label class="f" style="margin-top:10px">Aluno ${c.nome_lido ? `<span>· escrito na prova: <b dir="auto">${esc(c.nome_lido)}</b>${c.nome_incerto ? " <span class='pill warn'>conferir</span>" : ""}</span>` : ""}
@@ -796,9 +950,21 @@ async function telaCorrecao(id) {
     </div>
     <div class="card"><label class="f">Comentário para o aluno<textarea id="cCom" rows="4" dir="auto">${esc(c.comentario)}</textarea></label>
       <button id="cCopiar">Copiar devolutiva</button></div>
-    <button class="pri big fab" id="cRev" ${c.revisado ? "disabled" : ""}>${c.revisado ? "Revisado ✓" : "Marcar como revisado"}</button>` : ""}`;
+` : ""}
+    <div class="navbar">
+      <button id="cAnt" ${ant ? "" : "disabled"} aria-label="Aluno anterior">◂</button>
+      ${c.status === "corrigido" && !c.revisado ? `<button class="pri grow" id="cRev">✓ Revisado${prox ? " e próximo ▸" : ""}</button>`
+        : `<button class="pri grow" id="cProx2" ${prox ? "" : "disabled"}>${prox ? "Próximo aluno ▸" : (c.revisado ? "Revisado ✓ · último" : "Último aluno")}</button>`}
+      <button id="cProx" ${prox ? "" : "disabled"} aria-label="Próximo aluno">▸</button>
+    </div>`;
   return [html, () => {
     $$("[data-zoom]").forEach(i => i.onclick = () => zoom(i.src));
+    $("#cIr").onchange = e => ir("#/c/" + e.target.value);
+    if (ant) $("#cAnt").onclick = () => ir("#/c/" + ant.id);
+    if (prox) { $("#cProx").onclick = () => ir("#/c/" + prox.id); const b2 = $("#cProx2"); if (b2) b2.onclick = () => ir("#/c/" + prox.id); }
+    const br = $("#cRev"); if (br) br.onclick = async () => {
+      try { await q(sb.from("correcoes").update({ revisado: true }).eq("id", id)); c.revisado = true; toast("Revisado"); ir(prox ? "#/c/" + prox.id : pai); } catch (e) { falha(e); }
+    };
     $("#cAluno").onchange = async e => {
       let v = e.target.value;
       if (v === "__novo") { const n = await perguntar("Nome do novo aluno", c.nome_lido || ""); if (!n) { e.target.value = c.aluno_id || ""; return; } try { v = (await q(sb.from("alunos").insert({ disciplina_id: p.disciplina_id, nome: n }).select().single())).id; } catch (er) { falha(er); return; } }
@@ -806,7 +972,7 @@ async function telaCorrecao(id) {
     };
     $("#cRefazer").onclick = () => { enfileirar(id); render(true); };
     $("#cMaisPag").onclick = () => abrirCamera({ titulo: "Página extra", umSo: true, onAluno: async blobs => { try { const novos = await enviarFotos(p.id, id, blobs); await q(sb.from("correcoes").update({ fotos: [...c.fotos, ...novos] }).eq("id", id)); toast("Página adicionada. Toque em Corrigir de novo."); render(true); } catch (e) { falha(e); } } });
-    $("#cExcl").onclick = async () => { if (await confirmar("Excluir esta prova corrigida e as fotos?", "Excluir")) { try { if (c.fotos.length) await sb.storage.from("provas").remove(c.fotos); await q(sb.from("correcoes").delete().eq("id", id)); ir(`#/p/${p.id}/corrigir`); } catch (e) { falha(e); } } };
+    $("#cExcl").onclick = async () => { if (await confirmar("Excluir esta prova corrigida e as fotos?", "Excluir")) { try { if (c.fotos.length) await sb.storage.from("provas").remove(c.fotos); await q(sb.from("correcoes").delete().eq("id", id)); ir(prox ? "#/c/" + prox.id : ant ? "#/c/" + ant.id : pai); } catch (e) { falha(e); } } };
     if (c.status !== "corrigido") return;
     $$("[data-n]").forEach(inp => inp.onchange = async () => {
       const x = c.questoes[+inp.dataset.n]; x.nota = r2(clamp(num(inp.value) ?? 0, 0, Number(x.valor))); x.pct = x.valor ? Math.round(x.nota / x.valor * 100) : 0;
@@ -825,7 +991,6 @@ async function telaCorrecao(id) {
     });
     $("#cCom").onchange = async e => { try { await q(sb.from("correcoes").update({ comentario: e.target.value }).eq("id", id)); } catch (er) { falha(er); } };
     $("#cCopiar").onclick = async () => { try { await navigator.clipboard.writeText(devolutiva({ ...c, comentario: $("#cCom").value }, am)); toast("Copiado"); } catch { toast("Não foi possível copiar"); } };
-    $("#cRev").onclick = async () => { try { await q(sb.from("correcoes").update({ revisado: true }).eq("id", id)); toast("Revisado"); ir(`#/p/${p.id}/corrigir`); } catch (e) { falha(e); } };
   }];
 }
 
